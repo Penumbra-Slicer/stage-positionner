@@ -1,0 +1,276 @@
+#include "OrientationOptimizer.hpp"
+
+#include <igl/per_face_normals.h>
+#include <igl/doublearea.h>
+#include <igl/AABB.h>
+
+#include <Eigen/Geometry>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <unordered_map>
+
+using Clock = std::chrono::steady_clock;
+static double msec(Clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+}
+
+namespace OrientationOptimizer {
+
+// ─── weldSoup ────────────────────────────────────────────────────────────────
+// Manual vertex welding — avoids igl::remove_duplicate_vertices which uses
+// Eigen::all, removed in Eigen 5.x.
+
+static size_t quantize(float v, float eps) {
+    return static_cast<size_t>(std::floor(v / eps + 0.5f));
+}
+
+void weldSoup(const std::vector<Triangle>& tris,
+              Eigen::MatrixXf& V, Eigen::MatrixXi& F)
+{
+    constexpr float eps = 1e-6f;
+
+    struct Key {
+        size_t x, y, z;
+        bool operator==(const Key& o) const { return x==o.x && y==o.y && z==o.z; }
+    };
+    struct KeyHash {
+        size_t operator()(const Key& k) const {
+            size_t h = k.x;
+            h ^= k.y + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= k.z + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+
+    std::unordered_map<Key, int, KeyHash> index;
+    std::vector<std::array<float,3>> verts;
+    std::vector<std::array<int,3>>   faces;
+    faces.reserve(tris.size());
+
+    for (const auto& tri : tris) {
+        std::array<int,3> face{};
+        for (int k = 0; k < 3; ++k) {
+            Key key{ quantize(tri.v[k].x, eps),
+                     quantize(tri.v[k].y, eps),
+                     quantize(tri.v[k].z, eps) };
+            auto [it, inserted] = index.emplace(key, (int)verts.size());
+            if (inserted)
+                verts.push_back({tri.v[k].x, tri.v[k].y, tri.v[k].z});
+            face[k] = it->second;
+        }
+        // Degenerate check: skip if two vertices map to the same index
+        if (face[0] != face[1] && face[1] != face[2] && face[0] != face[2])
+            faces.push_back(face);
+    }
+
+    V.resize((int)verts.size(), 3);
+    for (int i = 0; i < (int)verts.size(); ++i)
+        V.row(i) << verts[i][0], verts[i][1], verts[i][2];
+
+    F.resize((int)faces.size(), 3);
+    for (int i = 0; i < (int)faces.size(); ++i)
+        F.row(i) << faces[i][0], faces[i][1], faces[i][2];
+}
+
+// ─── calculateNormalTensor ───────────────────────────────────────────────────
+
+Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f>
+calculateNormalTensor(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F)
+{
+    Eigen::MatrixXf N;
+    igl::per_face_normals(V, F, N);
+
+    Eigen::VectorXd dA;
+    igl::doublearea(V, F, dA); // twice the area per face
+
+    Eigen::Matrix3f C = Eigen::Matrix3f::Zero();
+    for (int i = 0; i < F.rows(); ++i) {
+        Eigen::Vector3f n = N.row(i).transpose();
+        C += static_cast<float>(dA(i) * 0.5) * (n * n.transpose());
+    }
+
+    return Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f>(C);
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+static Eigen::MatrixXf rotateV(const Eigen::MatrixXf& V, const Eigen::Matrix3f& R) {
+    return (R * V.transpose()).transpose();
+}
+
+// Builds a rotation matrix that aligns axis `a` with +Z.
+static Eigen::Matrix3f alignToZ(const Eigen::Vector3f& a) {
+    Eigen::Vector3f z(0, 0, 1);
+    Eigen::Vector3f v = a.cross(z);
+    float s = v.norm();
+    float c = a.dot(z);
+    if (s < 1e-8f) {
+        // Already aligned or anti-aligned
+        return (c > 0.f) ? Eigen::Matrix3f::Identity()
+                         : Eigen::AngleAxisf(static_cast<float>(M_PI),
+                                             Eigen::Vector3f::UnitX()).toRotationMatrix();
+    }
+    Eigen::Matrix3f vx;
+    vx <<    0, -v(2),  v(1),
+           v(2),    0, -v(0),
+          -v(1),  v(0),    0;
+    return Eigen::Matrix3f::Identity() + vx + vx * vx * ((1.f - c) / (s * s));
+}
+
+// ─── countIslands ────────────────────────────────────────────────────────────
+
+int countIslands(const Eigen::MatrixXf& V,
+                 const HalfEdgeMesh&    he,
+                 const Eigen::Matrix3f& R)
+{
+    Eigen::MatrixXf Vr = rotateV(V, R);
+    const int nv = static_cast<int>(Vr.rows());
+
+    std::vector<uint8_t> is_island(nv, 1);
+
+    for (int i = 0; i < (int)he.halfEdges.size(); ++i) {
+        const int twin = he.halfEdges[i].twin;
+        if (twin >= 0 && twin < i) continue; // each undirected edge once
+
+        const int v0 = he.halfEdges[i].vertex;
+        const int v1 = (twin >= 0)
+                       ? he.halfEdges[twin].vertex
+                       : he.halfEdges[he.halfEdges[i].prev].vertex;
+
+        const float z0 = Vr(v0, 2), z1 = Vr(v1, 2);
+        if (z0 >= z1) is_island[v0] = 0;
+        if (z1 >= z0) is_island[v1] = 0;
+    }
+
+    return static_cast<int>(std::count(is_island.begin(), is_island.end(), uint8_t(1)));
+}
+
+// ─── detectSuction ───────────────────────────────────────────────────────────
+
+int detectSuction(const Eigen::MatrixXf& V,
+                  const Eigen::MatrixXi& F,
+                  const Eigen::Matrix3f& R)
+{
+    Eigen::MatrixXf Vr = rotateV(V, R);
+
+    // Cast rays upward (+Z) from a regular grid over the XY footprint.
+    // A suction cup is detected when the first face hit by a ray is back-facing.
+    igl::AABB<Eigen::MatrixXf, 3> tree;
+    tree.init(Vr, F);
+
+    float xMin = Vr.col(0).minCoeff(), xMax = Vr.col(0).maxCoeff();
+    float yMin = Vr.col(1).minCoeff(), yMax = Vr.col(1).maxCoeff();
+    float zMin = Vr.col(2).minCoeff() - 1.f;
+
+    const int gridN  = 32;
+    const float dx   = (xMax - xMin) / gridN;
+    const float dy   = (yMax - yMin) / gridN;
+
+    Eigen::MatrixXf N;
+    igl::per_face_normals(Vr, F, N);
+
+    const Eigen::RowVector3f dir(0, 0, 1);
+    int suctionCount = 0;
+
+    for (int i = 0; i < gridN; ++i) {
+        for (int j = 0; j < gridN; ++j) {
+            float ox = xMin + (i + 0.5f) * dx;
+            float oy = yMin + (j + 0.5f) * dy;
+
+            Eigen::RowVector3f origin(ox, oy, zMin);
+            igl::Hit hit;
+            if (tree.intersect_ray(Vr, F, origin, dir, hit)) {
+                // Back-face: normal points in same direction as ray (+Z)
+                if (N.row(hit.id).dot(dir) > 0.f)
+                    ++suctionCount;
+            }
+        }
+    }
+    return suctionCount;
+}
+
+// ─── candidateAxes ───────────────────────────────────────────────────────────
+
+CandidateInfo
+candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F)
+{
+    auto t0 = Clock::now();
+    auto solver = calculateNormalTensor(V, F);
+    std::cerr << "  normalTensor:    " << std::fixed << std::setprecision(1) << msec(t0) << " ms\n";
+
+    Eigen::Vector3f vMin = solver.eigenvectors().col(0);
+    Eigen::Vector3f vMid = solver.eigenvectors().col(1);
+    // Order matches the suctionScores[4] index used by the GPU overload.
+    return {
+        {alignToZ(vMin), alignToZ(-vMin), alignToZ(vMid), alignToZ(-vMid)},
+        static_cast<float>(solver.eigenvalues()(0)),
+        static_cast<float>(solver.eigenvalues()(2))
+    };
+}
+
+// ─── findBestRotation (shared scoring helper) ─────────────────────────────────
+
+static Eigen::Matrix3f bestRotationFromScores(
+    const Eigen::MatrixXf& V,
+    const HalfEdgeMesh&    he,
+    const OrientWeights&   w,
+    const int              suctionScores[4],
+    const CandidateInfo&   ci)
+{
+    const int nv       = static_cast<int>(V.rows());
+    const int gridArea = 32 * 32;
+
+    float bestCost = std::numeric_limits<float>::max();
+    Eigen::Matrix3f bestR = Eigen::Matrix3f::Identity();
+
+    for (int k = 0; k < 4; ++k) {
+        const Eigen::Matrix3f& R = ci.rotations[k];
+
+        auto t0 = Clock::now();
+        int islands = countIslands(V, he, R);
+        std::cerr << "  countIslands[" << k << "]: " << msec(t0) << " ms"
+                  << "  (count=" << islands << ")\n";
+
+        float peelNorm    = (ci.lambdaMax > 1e-8f) ? ci.lambdaMin / ci.lambdaMax : 0.f;
+        float islandsNorm = (nv > 0) ? static_cast<float>(islands) / nv : 0.f;
+        float suctionNorm = (gridArea > 0) ? static_cast<float>(suctionScores[k]) / gridArea : 0.f;
+
+        float cost = w.peel * peelNorm + w.islands * islandsNorm + w.suction * suctionNorm;
+        if (cost < bestCost) { bestCost = cost; bestR = R; }
+    }
+    return bestR;
+}
+
+// ─── findBestRotation — CPU path ─────────────────────────────────────────────
+
+Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
+                                  const Eigen::MatrixXi& F,
+                                  const HalfEdgeMesh&    he,
+                                  const OrientWeights&   w)
+{
+    CandidateInfo ci = candidateAxes(V, F);
+
+    int suctionScores[4] = {};
+    for (int k = 0; k < 4; ++k)
+        suctionScores[k] = detectSuction(V, F, ci.rotations[k]);
+
+    return bestRotationFromScores(V, he, w, suctionScores, ci);
+}
+
+// ─── findBestRotation — GPU path (pre-computed suction scores) ───────────────
+
+Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
+                                  const Eigen::MatrixXi& F,
+                                  const HalfEdgeMesh&    he,
+                                  const OrientWeights&   w,
+                                  const int              suctionScores[4],
+                                  const CandidateInfo&   ci)
+{
+    return bestRotationFromScores(V, he, w, suctionScores, ci);
+}
+
+} // namespace OrientationOptimizer
