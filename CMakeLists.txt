@@ -20,24 +20,17 @@ if(NOT libigl_FOUND)
     FetchContent_MakeAvailable(libigl)
 endif()
 
-# ── GLSL → SPIR-V compilation ─────────────────────────────────────────────────
-find_program(GLSLC glslc REQUIRED)
-set(SHADER_OUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders/")
-file(MAKE_DIRECTORY "${SHADER_OUT_DIR}")
-
-foreach(SHADER suction.vert suction.frag pack_droptest.comp)
-    add_custom_command(
-        OUTPUT  "${SHADER_OUT_DIR}${SHADER}.spv"
-        COMMAND ${GLSLC} -o "${SHADER_OUT_DIR}${SHADER}.spv"
-                         "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/${SHADER}"
-        COMMENT "Compiling ${SHADER} → ${SHADER}.spv"
-    )
-endforeach()
-add_custom_target(suction-shaders DEPENDS
-    "${SHADER_OUT_DIR}suction.vert.spv"
-    "${SHADER_OUT_DIR}suction.frag.spv"
-    "${SHADER_OUT_DIR}pack_droptest.comp.spv")
+# ── shaderc (runtime GLSL → SPIR-V compilation) ───────────────────────────────
+find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.hpp
+    HINTS ${Vulkan_INCLUDE_DIRS} /usr/local/include /opt/homebrew/include
+    REQUIRED)
+find_library(SHADERC_LIBRARY NAMES shaderc_combined shaderc shaderc_shared
+    HINTS ${Vulkan_LIBRARY_DIRS} /usr/local/lib /opt/homebrew/lib
+    REQUIRED)
+add_library(shaderc::shaderc UNKNOWN IMPORTED)
+set_target_properties(shaderc::shaderc PROPERTIES
+    IMPORTED_LOCATION "${SHADERC_LIBRARY}"
+    INTERFACE_INCLUDE_DIRECTORIES "${SHADERC_INCLUDE_DIR}")
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 set(STAGE_SOURCES
@@ -49,24 +42,18 @@ set(STAGE_SOURCES
 
 # ── Plugin .dylib — loaded by the C++ runner at runtime ──────────────────────
 add_library(stage-positionner SHARED ${STAGE_SOURCES})
-add_dependencies(stage-positionner suction-shaders)
 target_include_directories(stage-positionner PRIVATE include src)
 target_link_libraries(stage-positionner PRIVATE
-    pipeline-core Eigen3::Eigen igl::core Vulkan::Vulkan)
-target_compile_definitions(stage-positionner PRIVATE
-    SUCTION_SHADER_DIR="${SHADER_OUT_DIR}")
+    pipeline-core Eigen3::Eigen igl::core Vulkan::Vulkan shaderc::shaderc)
 set_target_properties(stage-positionner PROPERTIES PREFIX "")
 
 # ── Python extension — only built via scikit-build-core (pip install .) ───────
 if(DEFINED SKBUILD)
     find_package(pybind11 CONFIG REQUIRED)
     pybind11_add_module(_stage_positionner python/bindings.cpp ${STAGE_SOURCES})
-    add_dependencies(_stage_positionner suction-shaders)
     target_include_directories(_stage_positionner PRIVATE include src)
     target_link_libraries(_stage_positionner PRIVATE
-        pipeline-core Eigen3::Eigen igl::core Vulkan::Vulkan)
-    target_compile_definitions(_stage_positionner PRIVATE
-        SUCTION_SHADER_DIR="${SHADER_OUT_DIR}")
+        pipeline-core Eigen3::Eigen igl::core Vulkan::Vulkan shaderc::shaderc)
     install(TARGETS _stage_positionner DESTINATION stage_positionner)
 endif()
 
@@ -101,14 +88,11 @@ if(BUILD_TESTING AND NOT DEFINED SKBUILD)
         tests/test_packing_gpu.cpp
         src/PackingPass.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../Runner/src/GpuRuntime.cpp)
-    add_dependencies(test_packing_gpu suction-shaders)
     target_include_directories(test_packing_gpu PRIVATE
         include src
         ${CMAKE_CURRENT_SOURCE_DIR}/../Runner/src
         ${CMAKE_CURRENT_SOURCE_DIR}/../Runner/include)
     target_link_libraries(test_packing_gpu PRIVATE
-        pipeline-core Eigen3::Eigen Vulkan::Vulkan LavaCake)
-    target_compile_definitions(test_packing_gpu PRIVATE
-        PACK_SHADER_DIR="${SHADER_OUT_DIR}")
+        pipeline-core Eigen3::Eigen Vulkan::Vulkan LavaCake shaderc::shaderc)
     add_test(NAME test_packing_gpu COMMAND test_packing_gpu)
 endif()

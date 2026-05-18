@@ -2,10 +2,6 @@
 #include "OrientationOptimizer.hpp"
 #include "PackingPass.hpp"
 
-#ifndef SUCTION_SHADER_DIR
-#  define SUCTION_SHADER_DIR ""
-#endif
-
 #include <HalfEdgeMesh.hpp>
 #include <MeshTypes.hpp>
 #include <DataBuffer.hpp>
@@ -312,15 +308,14 @@ void PositionnerStage::initGpu(const GpuContext& ctx) {
     gpuCtx_ = ctx;
     try {
         suctionPass_ = std::make_unique<SuctionPass>();
-        suctionPass_->init(ctx, SUCTION_SHADER_DIR);
+        suctionPass_->init(ctx);
     } catch (const std::exception& e) {
         std::cerr << "[positionner] GPU suction pass init failed: " << e.what()
                   << " — falling back to CPU.\n";
         suctionPass_.reset();
     }
-    std::cerr << "[positionner] packing GPU init — shader dir: " << SUCTION_SHADER_DIR << "\n";
     try {
-        packingPass_.init(ctx, SUCTION_SHADER_DIR);
+        packingPass_.init(ctx);
         std::cerr << "[positionner] packing GPU init OK\n";
     } catch (const std::exception& e) {
         std::cerr << "[positionner] packing GPU init FAILED: " << e.what() << "\n";

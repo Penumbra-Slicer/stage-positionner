@@ -30,7 +30,7 @@ static bool test_gpu_init(GpuContext& ctx) {
     PackingPass packer;
     bool threw = false;
     try {
-        packer.init(ctx, PACK_SHADER_DIR);
+        packer.init(ctx);
     } catch (const std::exception& e) {
         std::cerr << "  init threw: " << e.what() << "\n";
         threw = true;
@@ -66,7 +66,7 @@ static void test_gpu_cpu_equivalence(GpuContext& ctx) {
 
     // GPU path
     PackingPass gpuPacker;
-    gpuPacker.init(ctx, PACK_SHADER_DIR);
+    gpuPacker.init(ctx);
     auto gpuResult = gpuPacker.pack(rotV, faces, idx, aMin, aMax, p);
 
     assert(cpuResult.size() == 1 && gpuResult.size() == 1);
@@ -103,7 +103,7 @@ static void test_gpu_push_constants(GpuContext& ctx) {
     std::vector<Eigen::Vector3f> aMax  = {{1.f, 1.f, 5.f}};
 
     PackingPass gpuPacker;
-    gpuPacker.init(ctx, PACK_SHADER_DIR);
+    gpuPacker.init(ctx);
     auto result = gpuPacker.pack(rotV, faces, idx, aMin, aMax, p);
 
     assert(result.size() == 1);
@@ -138,7 +138,7 @@ static void test_gpu_sentinel_skipped(GpuContext& ctx) {
     std::vector<Eigen::Vector3f> aMax  = {{10.f, 10.f, 2.f}};
 
     PackingPass gpuPacker;
-    gpuPacker.init(ctx, PACK_SHADER_DIR);
+    gpuPacker.init(ctx);
     auto result = gpuPacker.pack(rotV, faces, idx, aMin, aMax, p);
 
     assert(result.size() == 1);
@@ -174,7 +174,7 @@ static void test_gpu_stamp_visible(GpuContext& ctx) {
     std::vector<Eigen::Vector3f> aMax  = {{20.f,20.f,10.f}, {20.f,20.f,10.f}};
 
     PackingPass gpuPacker;
-    gpuPacker.init(ctx, PACK_SHADER_DIR);
+    gpuPacker.init(ctx);
     auto result = gpuPacker.pack(rotV, faces, idx, aMin, aMax, p);
 
     assert(result.size() == 2);

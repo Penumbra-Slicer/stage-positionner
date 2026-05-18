@@ -1,7 +1,6 @@
 #pragma once
 #include <GpuContext.hpp>
 #include <Eigen/Core>
-#include <string>
 
 /// Offscreen Vulkan pass that counts suction-cup pixels for a single candidate
 /// rotation.  Uses dynamic rendering (no VkRenderPass / VkFramebuffer).
@@ -9,9 +8,9 @@
 /// GpuContext.
 class SuctionPass {
 public:
-    /// One-time setup: builds the graphics pipeline from the pre-compiled SPIR-V
-    /// shaders in shaderDir.  shaderDir must end with '/'.
-    void init(const GpuContext& ctx, const std::string& shaderDir);
+    /// One-time setup: compiles the embedded GLSL shaders and builds the
+    /// graphics pipeline.
+    void init(const GpuContext& ctx);
 
     ~SuctionPass();
 

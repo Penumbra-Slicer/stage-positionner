@@ -1,50 +1,104 @@
 #include "PackingPass.hpp"
 
+#include <shaderc/shaderc.hpp>
+
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstring>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
+
+// ── Embedded GLSL source ──────────────────────────────────────────────────────
+
+static const char kPackDroptestCompGlsl[] = R"glsl(
+#version 450
+
+// Each invocation handles one (px, py) candidate position on the build plate.
+// It loops over the part footprint and computes the minimum Z lift needed to
+// clear the current global heightmap without collision.
+//
+// Binding 0: G        — global heightmap [plateW * plateH], read-write
+// Binding 1: partZMin — part bottom profile [partW * partH], read-only
+// Binding 2: cand     — output: required Z per plate position [plateW * plateH]
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0) buffer GlobalHM  { float g[];    };
+layout(set = 0, binding = 1) buffer PartZMin  { float zmin[]; };
+layout(set = 0, binding = 2) buffer Cands     { float cand[]; };
+
+layout(push_constant) uniform PC {
+    int   plateW;
+    int   plateH;
+    int   partW;
+    int   partH;
+    float clearance;
+} pc;
+
+const float SENTINEL = 1.0e38;
+
+void main() {
+    int px = int(gl_GlobalInvocationID.x);
+    int py = int(gl_GlobalInvocationID.y);
+
+    if (px >= pc.plateW || py >= pc.plateH) return;
+
+    int outIdx = py * pc.plateW + px;
+
+    // Positions where any part pixel would land outside the plate: invalid.
+    if (px + pc.partW > pc.plateW || py + pc.partH > pc.plateH) {
+        cand[outIdx] = SENTINEL;
+        return;
+    }
+
+    float maxInterference = 0.0;
+    for (int j = 0; j < pc.partH; ++j) {
+        for (int i = 0; i < pc.partW; ++i) {
+            float zm = zmin[j * pc.partW + i];
+            if (zm >= SENTINEL * 0.5) continue; // sentinel: no vertex in pixel
+            float gv = g[(py + j) * pc.plateW + (px + i)];
+            maxInterference = max(maxInterference, gv - zm);
+        }
+    }
+
+    cand[outIdx] = maxInterference + pc.clearance;
+}
+)glsl";
 
 namespace {
 using Clock = std::chrono::steady_clock;
 double msec(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
-
-static std::vector<uint32_t> loadSpv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open())
-        throw std::runtime_error("PackingPass: cannot open shader: " + path);
-    auto sz = static_cast<size_t>(f.tellg());
-    if (sz % 4 != 0)
-        throw std::runtime_error("PackingPass: SPIR-V not 4-byte aligned: " + path);
-    std::vector<uint32_t> code(sz / 4);
-    f.seekg(0);
-    f.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(sz));
-    return code;
-}
 } // namespace
 
 // ─── initGpu ─────────────────────────────────────────────────────────────────
 
-void PackingPass::init(const GpuContext& ctx, const std::string& shaderDir) {
+void PackingPass::init(const GpuContext& ctx) {
     device_  = ctx.device;
     physDev_ = ctx.physDevice;
     queue_   = ctx.queue;
     cmdPool_ = ctx.cmdPool;
 
-    // 1. Shader module
+    // 1. Shader module — compiled from embedded GLSL at runtime
     {
-        auto code = loadSpv(shaderDir + "pack_droptest.comp.spv");
+        shaderc::Compiler compiler;
+        shaderc::CompileOptions opts;
+        opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
+        opts.SetOptimizationLevel(shaderc_optimization_level_performance);
+        auto result = compiler.CompileGlslToSpv(
+            kPackDroptestCompGlsl, shaderc_compute_shader, "pack_droptest.comp", opts);
+        if (result.GetCompilationStatus() != shaderc_compilation_status_success)
+            throw std::runtime_error(std::string("PackingPass: shader compile error: ") +
+                                     result.GetErrorMessage());
+        std::vector<uint32_t> spv(result.cbegin(), result.cend());
         vk::ShaderModuleCreateInfo si{};
-        si.codeSize = code.size() * 4;
-        si.pCode    = code.data();
+        si.codeSize = spv.size() * sizeof(uint32_t);
+        si.pCode    = spv.data();
         compMod_ = device_.createShaderModuleUnique(si);
     }
 

@@ -1,26 +1,53 @@
 #include "SuctionPass.hpp"
 
 #include <Eigen/Geometry>
+#include <shaderc/shaderc.hpp>
 
 #include <array>
 #include <cstring>
-#include <fstream>
 #include <stdexcept>
 #include <vector>
 
+// ── Embedded GLSL sources ─────────────────────────────────────────────────────
+
+static const char kSuctionVertGlsl[] = R"glsl(
+#version 450
+layout(location = 0) in vec3 inPos;
+layout(push_constant) uniform PC { mat4 mvp; } pc;
+layout(location = 0) out vec3 fragWorldPos;
+void main() {
+    fragWorldPos = inPos;
+    gl_Position  = pc.mvp * vec4(inPos, 1.0);
+}
+)glsl";
+
+static const char kSuctionFragGlsl[] = R"glsl(
+#version 450
+layout(location = 0) in  vec3  fragWorldPos;
+layout(location = 0) out float outSuction;
+void main() {
+    vec3 N = normalize(cross(dFdx(fragWorldPos), dFdy(fragWorldPos)));
+    outSuction = (N.z > 0.0) ? 1.0 : 0.0;
+}
+)glsl";
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-static std::vector<uint32_t> loadSpv(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open())
-        throw std::runtime_error("SuctionPass: cannot open shader: " + path);
-    auto sz = static_cast<size_t>(f.tellg());
-    if (sz % 4 != 0)
-        throw std::runtime_error("SuctionPass: SPIR-V size not aligned: " + path);
-    std::vector<uint32_t> code(sz / 4);
-    f.seekg(0);
-    f.read(reinterpret_cast<char*>(code.data()), static_cast<std::streamsize>(sz));
-    return code;
+static vk::UniqueShaderModule compileGlsl(vk::Device device, const char* src,
+                                          shaderc_shader_kind kind, const char* name) {
+    shaderc::Compiler compiler;
+    shaderc::CompileOptions opts;
+    opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
+    opts.SetOptimizationLevel(shaderc_optimization_level_performance);
+    auto result = compiler.CompileGlslToSpv(src, kind, name, opts);
+    if (result.GetCompilationStatus() != shaderc_compilation_status_success)
+        throw std::runtime_error(std::string("SuctionPass: shader compile error (") +
+                                 name + "): " + result.GetErrorMessage());
+    std::vector<uint32_t> spv(result.cbegin(), result.cend());
+    vk::ShaderModuleCreateInfo ci{};
+    ci.codeSize = spv.size() * sizeof(uint32_t);
+    ci.pCode    = spv.data();
+    return device.createShaderModuleUnique(ci);
 }
 
 uint32_t SuctionPass::findMemType(vk::PhysicalDevice pd,
@@ -38,20 +65,13 @@ uint32_t SuctionPass::findMemType(vk::PhysicalDevice pd,
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
-void SuctionPass::init(const GpuContext& ctx, const std::string& shaderDir) {
+void SuctionPass::init(const GpuContext& ctx) {
     device_ = ctx.device;
 
     // 1. Shader modules
     {
-        auto vertCode = loadSpv(shaderDir + "suction.vert.spv");
-        auto fragCode = loadSpv(shaderDir + "suction.frag.spv");
-        vk::ShaderModuleCreateInfo si{};
-        si.codeSize = vertCode.size() * 4;
-        si.pCode    = vertCode.data();
-        vertMod_ = ctx.device.createShaderModuleUnique(si);
-        si.codeSize = fragCode.size() * 4;
-        si.pCode    = fragCode.data();
-        fragMod_ = ctx.device.createShaderModuleUnique(si);
+        vertMod_ = compileGlsl(ctx.device, kSuctionVertGlsl, shaderc_vertex_shader,   "suction.vert");
+        fragMod_ = compileGlsl(ctx.device, kSuctionFragGlsl, shaderc_fragment_shader, "suction.frag");
     }
 
     // 2. Pipeline layout — one push constant: mat4 (64 bytes) in vertex stage

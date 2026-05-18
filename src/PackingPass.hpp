@@ -2,7 +2,6 @@
 #include <GpuContext.hpp>
 #include <Eigen/Core>
 #include <cstdint>
-#include <string>
 #include <vector>
 #include <vulkan/vulkan.hpp>
 
@@ -36,8 +35,8 @@ public:
     };
 
     /// One-time GPU setup.  Call before pack() to enable the compute path.
-    /// shaderDir must end with '/' and contain pack_droptest.comp.spv.
-    void init(const GpuContext& ctx, const std::string& shaderDir);
+    /// Compiles the embedded GLSL compute shader at runtime via shaderc.
+    void init(const GpuContext& ctx);
 
     ~PackingPass();
 
