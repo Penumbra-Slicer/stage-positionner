@@ -93,7 +93,7 @@ if(BUILD_TESTING AND NOT DEFINED SKBUILD)
     include(FetchContent)
     FetchContent_Declare(LavaCake
         GIT_REPOSITORY https://github.com/ThibaultTricard/LavaCake.git
-        GIT_TAG        e54f0a8)
+        GIT_TAG        45485ff)
     set(LAVACAKE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(LavaCake)
 
