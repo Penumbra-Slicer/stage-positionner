@@ -19,7 +19,6 @@ layout(push_constant) uniform PC {
     int   plateH;
     int   partW;
     int   partH;
-    float clearance;
 } pc;
 
 const float SENTINEL = 1.0e38;
@@ -48,5 +47,5 @@ void main() {
         }
     }
 
-    cand[outIdx] = maxInterference + pc.clearance;
+    cand[outIdx] = maxInterference;
 }

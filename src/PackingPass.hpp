@@ -14,9 +14,6 @@
 ///      lowest required Z lift.  GPU path: one compute dispatch per part.
 ///   4. Stamp G with the placed part's Z-Max profile.
 ///   5. Emit per-instance translation deltas.
-///
-/// keepPosition mode: preserves user XY, only lifts each part in Z so its
-/// AABB floor sits at bedOffset.  No heightmap, no sorting.
 class PackingPass {
 public:
     struct Params {
@@ -26,7 +23,6 @@ public:
         float resolution  = 0.1f;   ///< heightmap pixel size (mm/pixel)
         float clearance   = 0.5f;   ///< minimum gap between parts (mm)
         float bedOffset   = 0.0f;   ///< minimum Z floor for all parts (mm)
-        bool  keepPosition = false; ///< skip XY packing; only lift Z to bedOffset
     };
 
     struct PlacedInstance {

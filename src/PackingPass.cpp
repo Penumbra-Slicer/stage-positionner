@@ -36,7 +36,6 @@ layout(push_constant) uniform PC {
     int   plateH;
     int   partW;
     int   partH;
-    float clearance;
 } pc;
 
 const float SENTINEL = 1.0e38;
@@ -65,7 +64,7 @@ void main() {
         }
     }
 
-    cand[outIdx] = maxInterference + pc.clearance;
+    cand[outIdx] = maxInterference;
 }
 )glsl";
 
@@ -117,7 +116,7 @@ void PackingPass::init(const GpuContext& ctx) {
 
     // 3. Pipeline layout: one descriptor set + push constants (5 × 4 bytes = 20)
     {
-        vk::PushConstantRange pcr{vk::ShaderStageFlagBits::eCompute, 0, 20};
+        vk::PushConstantRange pcr{vk::ShaderStageFlagBits::eCompute, 0, 16};
         vk::PipelineLayoutCreateInfo li{};
         li.setLayoutCount         = 1;
         li.pSetLayouts            = &*dsl_;
@@ -290,15 +289,6 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
     std::cerr << "[packing] " << N << " instance(s)"
               << (gpuReady_ ? "  [GPU]" : "  [CPU fallback]") << "\n";
 
-    // ── keepPosition fast path ───────────────────────────────────────────────
-    if (p.keepPosition) {
-        auto t0 = Clock::now();
-        for (uint32_t i = 0; i < N; ++i)
-            result[i].tz = p.bedOffset - instAABBMin[i].z();
-        std::cerr << "  keepPosition:    " << msec(t0) << " ms\n";
-        return result;
-    }
-
     if (p.plateX <= 0.f || p.plateY <= 0.f) {
         std::cerr << "[packing] plate dimensions not set — skipping\n";
         return result;
@@ -396,8 +386,8 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
             cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
                                    *pipeLayout_, 0, descSet_, {});
 
-            struct PC { int32_t plateW, plateH, partW, partH; float clearance; } pc{
-                plateW, plateH, msh.w, msh.h, p.clearance
+            struct PC { int32_t plateW, plateH, partW, partH; } pc{
+                plateW, plateH, msh.w, msh.h
             };
             cmd.pushConstants(*pipeLayout_, vk::ShaderStageFlagBits::eCompute,
                               0, sizeof(pc), &pc);
@@ -456,7 +446,6 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
                             if (zm == FLT_MAX) continue;
                             reqZ = std::max(reqZ, G_cpu[(py + j) * plateW + (px + i)] - zm);
                         }
-                    reqZ += p.clearance;
                     if (reqZ < bestZ) { bestZ = reqZ; bestPx = px; bestPy = py; }
                 }
             }
@@ -469,27 +458,38 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
             continue;
         }
 
-        // ── Stamp G (CPU — O(partW*partH), fast) ──────────────────────────────
+        // ── Stamp G with XY clearance expansion ───────────────────────────────
         t0 = Clock::now();
         float zTop = 0.f;
-        for (int j = 0; j < msh.h; ++j) {
-            for (int i = 0; i < msh.w; ++i) {
-                float zx = msh.zMax[j * msh.w + i];
-                if (zx == -FLT_MAX) continue;
-                float newZ = bestZ + zx;
-                int   gIdx = (bestPy + j) * plateW + (bestPx + i);
+        for (int j = 0; j < msh.h; ++j)
+            for (int i = 0; i < msh.w; ++i)
+                zTop = std::max(zTop, msh.zMax[j * msh.w + i]);
+
+        const int cp = (p.clearance > 0.f)
+            ? static_cast<int>(std::ceil(p.clearance / p.resolution)) : 0;
+
+        for (int j = -cp; j < msh.h + cp; ++j) {
+            for (int i = -cp; i < msh.w + cp; ++i) {
+                const int gx = bestPx + i;
+                const int gy = bestPy + j;
+                if (gx < 0 || gx >= plateW || gy < 0 || gy >= plateH) continue;
+                const float zx = (j >= 0 && j < msh.h && i >= 0 && i < msh.w)
+                                 ? msh.zMax[j * msh.w + i] : zTop;
+                const int   gIdx = gy * plateW + gx;
+                const float newZ = bestZ + zx;
                 G_cpu[gIdx] = std::max(G_cpu[gIdx], newZ);
                 if (gpuReady_)
                     globalHM_.ptr[gIdx] = G_cpu[gIdx];
-                zTop = std::max(zTop, newZ);
             }
         }
+        const float absTop = bestZ + zTop;
         std::cerr << "  stamp[" << instIdx << "]:      " << msec(t0) << " ms"
-                  << "  z=" << bestZ << " mm  zTop=" << zTop << " mm\n";
+                  << "  z=" << bestZ << " mm  zTop=" << absTop << " mm"
+                  << "  cp=" << cp << " px\n";
 
-        if (p.plateZ > 0.f && zTop > p.plateZ)
+        if (p.plateZ > 0.f && absTop > p.plateZ)
             std::cerr << "  WARNING: instance " << instIdx
-                      << " exceeds build height (" << zTop
+                      << " exceeds build height (" << absTop
                       << " mm > " << p.plateZ << " mm)\n";
 
         // ── Translation delta ──────────────────────────────────────────────────

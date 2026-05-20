@@ -31,7 +31,6 @@ private:
 
     // Packing
     bool  packEnable_      = true;
-    bool  keepPosition_    = false;
     float packResolution_  = 0.1f;
     float packClearance_   = 0.5f;
     float bedOffset_       = 0.0f;

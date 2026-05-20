@@ -33,15 +33,14 @@ std::string PositionnerStage::describeJson() const {
         R"j({"id":"Positionner","name":"Positionner",)j"
         R"j("cpuDataIn":"mesh/scene_graph_v1",)j"
         R"j("cpuDataOut":"mesh/scene_graph_v1","params":[)j"
-        R"j({"id":"orient.enable","label":"Enable orientation","type":"bool","default":true},)j"
-        R"j({"id":"orient.weight_peel","label":"Peel force weight","type":"float","min":0,"max":1,"default":0.6,"step":0.05},)j"
-        R"j({"id":"orient.weight_suction","label":"Suction cup weight","type":"float","min":0,"max":1,"default":0.25,"step":0.05},)j"
-        R"j({"id":"orient.weight_islands","label":"Floating island weight","type":"float","min":0,"max":1,"default":0.15,"step":0.05},)j"
-        R"j({"id":"pack.enable","label":"Enable packing","type":"bool","default":true},)j"
-        R"j({"id":"pack.keep_position","label":"Keep user XY position","type":"bool","default":false},)j"
-        R"j({"id":"pack.resolution","label":"Heightmap resolution (mm/px)","type":"float","min":0.01,"max":5,"default":0.1,"step":0.01},)j"
-        R"j({"id":"pack.clearance","label":"Part clearance (mm)","type":"float","min":0,"max":20,"default":0.5,"step":0.1},)j"
-        R"j({"id":"pack.bed_offset","label":"Bed offset / support lift (mm)","type":"float","min":0,"max":50,"default":0,"step":0.5})j"
+        R"j({"key":"orient.enable","label":"Enable orientation","type":"bool","default":true},)j"
+        R"j({"key":"orient.weight_peel","label":"Peel force weight","type":"float","min":0,"max":1,"default":0.6,"step":0.05},)j"
+        R"j({"key":"orient.weight_suction","label":"Suction cup weight","type":"float","min":0,"max":1,"default":0.25,"step":0.05},)j"
+        R"j({"key":"orient.weight_islands","label":"Floating island weight","type":"float","min":0,"max":1,"default":0.15,"step":0.05},)j"
+        R"j({"key":"pack.enable","label":"Enable packing","type":"bool","default":true},)j"
+        R"j({"key":"pack.resolution","label":"Heightmap resolution (mm/px)","type":"float","min":0.01,"max":5,"default":0.1,"step":0.01},)j"
+        R"j({"key":"pack.clearance","label":"Part clearance (mm)","type":"float","min":0,"max":20,"default":0.5,"step":0.1},)j"
+        R"j({"key":"pack.bed_offset","label":"Bed offset / support lift (mm)","type":"float","min":0,"max":50,"default":0,"step":0.5})j"
         R"j(]})j";
 }
 
@@ -56,7 +55,6 @@ ParameterSchema PositionnerStage::describe() const {
             { "orient.weight_suction", "Suction cup weight",             "Weight for suction cup penalty in cost function",              ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 1.f, 0.25f, 0.05f} },
             { "orient.weight_islands", "Floating island weight",         "Weight for floating island penalty in cost function",          ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 1.f, 0.15f, 0.05f} },
             { "pack.enable",           "Enable packing",                 "Arrange instances on the build plate automatically",           ParamType::Bool,  true, ParameterDescriptor::BoolMeta{true}  },
-            { "pack.keep_position",    "Keep user XY position",          "Preserve XY placement; only lift parts to bed offset",         ParamType::Bool,  true, ParameterDescriptor::BoolMeta{false} },
             { "pack.resolution",       "Heightmap resolution (mm/px)",   "Pixel size used for the packing heightmap",                    ParamType::Float, true, ParameterDescriptor::FloatMeta{0.01f, 5.f, 0.1f, 0.01f} },
             { "pack.clearance",        "Part clearance (mm)",            "Minimum gap between adjacent parts",                          ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 20.f, 0.5f, 0.1f} },
             { "pack.bed_offset",       "Bed offset / support lift (mm)", "Minimum Z height for all parts; set 3-5 mm for supports",      ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 50.f, 0.f, 0.5f} },
@@ -77,8 +75,6 @@ void PositionnerStage::configure(const ParameterValues& v) {
         weightIslands_ = std::get<float>(v.at("orient.weight_islands"));
     if (v.count("pack.enable"))
         packEnable_ = std::get<bool>(v.at("pack.enable"));
-    if (v.count("pack.keep_position"))
-        keepPosition_ = std::get<bool>(v.at("pack.keep_position"));
     if (v.count("pack.resolution"))
         packResolution_ = std::get<float>(v.at("pack.resolution"));
     if (v.count("pack.clearance"))
@@ -250,7 +246,6 @@ Result PositionnerStage::process(DataBuffer& data) {
             pp.resolution   = packResolution_;
             pp.clearance    = packClearance_;
             pp.bedOffset    = bedOffset_;
-            pp.keepPosition = keepPosition_;
 
             // Rotated vertices and faces per unique mesh.
             std::vector<Eigen::MatrixXf> rotV(hdr.meshCount);
