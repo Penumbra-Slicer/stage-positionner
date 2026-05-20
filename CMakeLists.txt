@@ -4,13 +4,27 @@ project(stage-positionner VERSION 0.0.1)
 find_package(pipeline-core REQUIRED)
 find_package(Vulkan REQUIRED)
 
-# ── Eigen3 ────────────────────────────────────────────────────────────────────
-find_package(Eigen3 REQUIRED NO_MODULE)
+include(FetchContent)
+
+# ── Eigen3 (header-only, always fetched) ─────────────────────────────────────
+FetchContent_Declare(
+    eigen
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG        3.4.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_GetProperties(eigen)
+if(NOT eigen_POPULATED)
+    FetchContent_Populate(eigen)
+endif()
+if(NOT TARGET Eigen3::Eigen)
+    add_library(Eigen3::Eigen INTERFACE IMPORTED GLOBAL)
+    target_include_directories(Eigen3::Eigen INTERFACE ${eigen_SOURCE_DIR})
+endif()
 
 # ── libigl (header-only, fetched if not present) ─────────────────────────────
 find_package(libigl QUIET)
 if(NOT libigl_FOUND)
-    include(FetchContent)
     FetchContent_Declare(
         libigl
         GIT_REPOSITORY https://github.com/libigl/libigl.git
@@ -80,7 +94,7 @@ if(BUILD_TESTING AND NOT DEFINED SKBUILD)
     include(FetchContent)
     FetchContent_Declare(LavaCake
         GIT_REPOSITORY https://github.com/ThibaultTricard/LavaCake.git
-        GIT_TAG        1cf2ee3)
+        GIT_TAG        591550a)
     set(LAVACAKE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(LavaCake)
 
