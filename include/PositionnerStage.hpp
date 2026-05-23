@@ -28,6 +28,7 @@ private:
     float weightPeel_      = 0.6f;
     float weightSuction_   = 0.25f;
     float weightIslands_   = 0.15f;
+    int   numCandidates_   = 32;
 
     // Packing
     bool  packEnable_      = true;

@@ -3,6 +3,7 @@
 #include <MeshTypes.hpp>
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
+#include <array>
 #include <vector>
 
 struct OrientWeights {
@@ -38,16 +39,17 @@ int detectSuction(const Eigen::MatrixXf& V,
 /// Result of candidateAxes(): rotation matrices + eigenvalues needed for scoring.
 /// Passed to findBestRotation (GPU path) to avoid recomputing the normal tensor.
 struct CandidateInfo {
-    std::array<Eigen::Matrix3f, 4> rotations; ///< alignToZ(±vMin, ±vMid)
+    std::vector<Eigen::Matrix3f> rotations; ///< numCandidates directions aligned to +Z
     float lambdaMin; ///< eigenvalue(0) — peel proxy
     float lambdaMax; ///< eigenvalue(2) — normalization denominator
 };
 
-/// Computes the normal tensor once and returns the four candidate rotations
-/// (±v_min, ±v_mid aligned to +Z) together with the eigenvalues needed for
-/// cost normalisation.  Index matches suctionScores[4] in findBestRotation.
+/// Computes the normal tensor once and returns numCandidates candidate rotations
+/// aligned to +Z.  The first 6 are always ±v0/±v1/±v2 (principal axes);
+/// the remainder are Fibonacci sphere samples.
+/// Index matches suctionScores in findBestRotation.
 CandidateInfo
-candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F);
+candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F, int numCandidates = 32);
 
 /// CPU path — evaluates all four candidates, calling detectSuction internally.
 Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
@@ -57,11 +59,11 @@ Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
 
 /// GPU path — accepts pre-computed suction pixel counts and the CandidateInfo
 /// returned by candidateAxes(), so the normal tensor is not recomputed.
-Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
-                                  const Eigen::MatrixXi& F,
-                                  const HalfEdgeMesh&    he,
-                                  const OrientWeights&   w,
-                                  const int              suctionScores[4],
-                                  const CandidateInfo&   ci);
+Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf&    V,
+                                  const Eigen::MatrixXi&    F,
+                                  const HalfEdgeMesh&       he,
+                                  const OrientWeights&      w,
+                                  const std::vector<int>&   suctionScores,
+                                  const CandidateInfo&      ci);
 
 } // namespace OrientationOptimizer

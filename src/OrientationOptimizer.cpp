@@ -193,20 +193,47 @@ int detectSuction(const Eigen::MatrixXf& V,
     return suctionCount;
 }
 
+// Golden ratio for Fibonacci sphere sampling.
+static constexpr float kGoldenRatio = 1.6180339887f;
+
 // ─── candidateAxes ───────────────────────────────────────────────────────────
 
 CandidateInfo
-candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F)
+candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F, int numCandidates)
 {
     auto t0 = Clock::now();
     auto solver = calculateNormalTensor(V, F);
     std::cerr << "  normalTensor:    " << std::fixed << std::setprecision(1) << msec(t0) << " ms\n";
 
-    Eigen::Vector3f vMin = solver.eigenvectors().col(0);
-    Eigen::Vector3f vMid = solver.eigenvectors().col(1);
-    // Order matches the suctionScores[4] index used by the GPU overload.
+    Eigen::Vector3f v0 = solver.eigenvectors().col(0);
+    Eigen::Vector3f v1 = solver.eigenvectors().col(1);
+    Eigen::Vector3f v2 = solver.eigenvectors().col(2);
+
+    std::vector<Eigen::Matrix3f> rots;
+    rots.reserve(std::max(numCandidates, 6));
+
+    // Fixed principal-axis candidates (always included).
+    rots.push_back(alignToZ( v0));
+    rots.push_back(alignToZ(-v0));
+    rots.push_back(alignToZ( v1));
+    rots.push_back(alignToZ(-v1));
+    rots.push_back(alignToZ( v2));
+    rots.push_back(alignToZ(-v2));
+
+    // Fill remainder with Fibonacci sphere samples for uniform coverage.
+    const int extra = numCandidates - 6;
+    for (int i = 0; i < extra; ++i) {
+        float theta = std::acos(1.f - 2.f * (i + 0.5f) / extra);
+        float phi   = 2.f * static_cast<float>(M_PI) * i / kGoldenRatio;
+        Eigen::Vector3f axis(
+            std::sin(theta) * std::cos(phi),
+            std::sin(theta) * std::sin(phi),
+            std::cos(theta));
+        rots.push_back(alignToZ(axis));
+    }
+
     return {
-        {alignToZ(vMin), alignToZ(-vMin), alignToZ(vMid), alignToZ(-vMid)},
+        std::move(rots),
         static_cast<float>(solver.eigenvalues()(0)),
         static_cast<float>(solver.eigenvalues()(2))
     };
@@ -215,32 +242,64 @@ candidateAxes(const Eigen::MatrixXf& V, const Eigen::MatrixXi& F)
 // ─── findBestRotation (shared scoring helper) ─────────────────────────────────
 
 static Eigen::Matrix3f bestRotationFromScores(
-    const Eigen::MatrixXf& V,
-    const HalfEdgeMesh&    he,
-    const OrientWeights&   w,
-    const int              suctionScores[4],
-    const CandidateInfo&   ci)
+    const Eigen::MatrixXf&  V,
+    const Eigen::MatrixXi&  F,
+    const HalfEdgeMesh&     he,
+    const OrientWeights&    w,
+    const std::vector<int>& suctionScores,
+    const CandidateInfo&    ci)
 {
-    const int nv       = static_cast<int>(V.rows());
-    const int gridArea = 32 * 32;
+    const int N = static_cast<int>(ci.rotations.size());
 
+    // Pre-compute face normals and half-areas once — reused for every candidate.
+    Eigen::MatrixXf faceN;
+    Eigen::VectorXd dA;
+    igl::per_face_normals(V, F, faceN);
+    igl::doublearea(V, F, dA);
+
+    // ── Pass 1: collect raw objective values for all candidates ──────────────
+    std::vector<float> peelRaw(N), islandsRaw(N), suctionRaw(N);
+
+    for (int k = 0; k < N; ++k) {
+        const Eigen::Matrix3f& R = ci.rotations[k];
+
+        // Peel: sum of downward-facing projected areas (face_area * max(0, -nz_rotated)).
+        Eigen::MatrixXf rotN = (R * faceN.transpose()).transpose();
+        float peel = 0.f;
+        for (int i = 0; i < rotN.rows(); ++i)
+            peel += static_cast<float>(dA(i)) * 0.5f * std::max(0.f, -rotN(i, 2));
+        peelRaw[k] = peel;
+
+        auto t0 = Clock::now();
+        islandsRaw[k] = static_cast<float>(countIslands(V, he, R));
+        std::cerr << "  countIslands[" << k << "]: " << msec(t0) << " ms"
+                  << "  (count=" << static_cast<int>(islandsRaw[k]) << ")\n";
+
+        suctionRaw[k] = static_cast<float>(suctionScores[k]);
+    }
+
+    // ── Normalize each objective to [0,1] across candidates ──────────────────
+    auto maxOf = [&](const std::vector<float>& v) {
+        return *std::max_element(v.begin(), v.end());
+    };
+    const float peelMax    = maxOf(peelRaw);
+    const float islandsMax = maxOf(islandsRaw);
+    const float suctionMax = maxOf(suctionRaw);
+
+    // ── Pass 2: pick best weighted cost ──────────────────────────────────────
     float bestCost = std::numeric_limits<float>::max();
     Eigen::Matrix3f bestR = Eigen::Matrix3f::Identity();
 
-    for (int k = 0; k < 4; ++k) {
-        const Eigen::Matrix3f& R = ci.rotations[k];
-
-        auto t0 = Clock::now();
-        int islands = countIslands(V, he, R);
-        std::cerr << "  countIslands[" << k << "]: " << msec(t0) << " ms"
-                  << "  (count=" << islands << ")\n";
-
-        float peelNorm    = (ci.lambdaMax > 1e-8f) ? ci.lambdaMin / ci.lambdaMax : 0.f;
-        float islandsNorm = (nv > 0) ? static_cast<float>(islands) / nv : 0.f;
-        float suctionNorm = (gridArea > 0) ? static_cast<float>(suctionScores[k]) / gridArea : 0.f;
+    for (int k = 0; k < N; ++k) {
+        float peelNorm    = (peelMax    > 1e-8f) ? peelRaw[k]    / peelMax    : 0.f;
+        float islandsNorm = (islandsMax > 1e-8f) ? islandsRaw[k] / islandsMax : 0.f;
+        float suctionNorm = (suctionMax > 1e-8f) ? suctionRaw[k] / suctionMax : 0.f;
 
         float cost = w.peel * peelNorm + w.islands * islandsNorm + w.suction * suctionNorm;
-        if (cost < bestCost) { bestCost = cost; bestR = R; }
+        std::cerr << "  candidate[" << k << "]: peel=" << peelNorm
+                  << " islands=" << islandsNorm << " suction=" << suctionNorm
+                  << " cost=" << cost << "\n";
+        if (cost < bestCost) { bestCost = cost; bestR = ci.rotations[k]; }
     }
     return bestR;
 }
@@ -254,23 +313,24 @@ Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
 {
     CandidateInfo ci = candidateAxes(V, F);
 
-    int suctionScores[4] = {};
-    for (int k = 0; k < 4; ++k)
+    const int N = static_cast<int>(ci.rotations.size());
+    std::vector<int> suctionScores(N);
+    for (int k = 0; k < N; ++k)
         suctionScores[k] = detectSuction(V, F, ci.rotations[k]);
 
-    return bestRotationFromScores(V, he, w, suctionScores, ci);
+    return bestRotationFromScores(V, F, he, w, suctionScores, ci);
 }
 
 // ─── findBestRotation — GPU path (pre-computed suction scores) ───────────────
 
-Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf& V,
-                                  const Eigen::MatrixXi& F,
-                                  const HalfEdgeMesh&    he,
-                                  const OrientWeights&   w,
-                                  const int              suctionScores[4],
-                                  const CandidateInfo&   ci)
+Eigen::Matrix3f findBestRotation(const Eigen::MatrixXf&  V,
+                                  const Eigen::MatrixXi&  F,
+                                  const HalfEdgeMesh&     he,
+                                  const OrientWeights&    w,
+                                  const std::vector<int>& suctionScores,
+                                  const CandidateInfo&    ci)
 {
-    return bestRotationFromScores(V, he, w, suctionScores, ci);
+    return bestRotationFromScores(V, F, he, w, suctionScores, ci);
 }
 
 } // namespace OrientationOptimizer

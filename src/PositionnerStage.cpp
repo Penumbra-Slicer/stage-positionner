@@ -34,6 +34,7 @@ std::string PositionnerStage::describeJson() const {
         R"j("cpuDataIn":"mesh/scene_graph_v1",)j"
         R"j("cpuDataOut":"mesh/scene_graph_v1","params":[)j"
         R"j({"key":"orient.enable","label":"Enable orientation","type":"bool","default":true},)j"
+        R"j({"key":"orient.num_candidates","label":"Candidate directions","type":"int","min":6,"max":256,"default":32,"step":1},)j"
         R"j({"key":"orient.weight_peel","label":"Peel force weight","type":"float","min":0,"max":1,"default":0.6,"step":0.05},)j"
         R"j({"key":"orient.weight_suction","label":"Suction cup weight","type":"float","min":0,"max":1,"default":0.25,"step":0.05},)j"
         R"j({"key":"orient.weight_islands","label":"Floating island weight","type":"float","min":0,"max":1,"default":0.15,"step":0.05},)j"
@@ -51,6 +52,7 @@ ParameterSchema PositionnerStage::describe() const {
         "positionner",
         {
             { "orient.enable",         "Enable orientation",             "Auto-rotate meshes for optimal DLP print orientation",         ParamType::Bool,  true, ParameterDescriptor::BoolMeta{true}  },
+            { "orient.num_candidates", "Candidate directions",           "Number of orientations evaluated (6 principal axes + Fibonacci sphere fill)", ParamType::Int, true, ParameterDescriptor::IntMeta{6, 256, 32} },
             { "orient.weight_peel",    "Peel force weight",              "Weight for peel force (projected area) in cost function",      ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 1.f, 0.6f,  0.05f} },
             { "orient.weight_suction", "Suction cup weight",             "Weight for suction cup penalty in cost function",              ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 1.f, 0.25f, 0.05f} },
             { "orient.weight_islands", "Floating island weight",         "Weight for floating island penalty in cost function",          ParamType::Float, true, ParameterDescriptor::FloatMeta{0.f, 1.f, 0.15f, 0.05f} },
@@ -67,6 +69,8 @@ ParameterSchema PositionnerStage::describe() const {
 void PositionnerStage::configure(const ParameterValues& v) {
     if (v.count("orient.enable"))
         orientEnable_ = std::get<bool>(v.at("orient.enable"));
+    if (v.count("orient.num_candidates"))
+        numCandidates_ = std::get<int>(v.at("orient.num_candidates"));
     if (v.count("orient.weight_peel"))
         weightPeel_ = std::get<float>(v.at("orient.weight_peel"));
     if (v.count("orient.weight_suction"))
@@ -160,13 +164,15 @@ Result PositionnerStage::process(DataBuffer& data) {
 
         if (orientEnable_ && meshes[m].triangleCount > 0) {
             t0 = Clock::now();
-            auto ci = OrientationOptimizer::candidateAxes(results[m].V, results[m].F);
-            std::cerr << "  candidateAxes:  " << msec(t0) << " ms\n";
+            auto ci = OrientationOptimizer::candidateAxes(results[m].V, results[m].F, numCandidates_);
+            std::cerr << "  candidateAxes:  " << msec(t0) << " ms"
+                      << "  (" << ci.rotations.size() << " directions)\n";
 
             if (suctionPass_) {
                 std::cerr << "  suction: GPU\n";
-                int suctionScores[4] = {};
-                for (int k = 0; k < 4; ++k) {
+                const int N = static_cast<int>(ci.rotations.size());
+                std::vector<int> suctionScores(N);
+                for (int k = 0; k < N; ++k) {
                     t0 = Clock::now();
                     Eigen::MatrixXf Vr =
                         (ci.rotations[k] * results[m].V.transpose()).transpose();
@@ -247,7 +253,9 @@ Result PositionnerStage::process(DataBuffer& data) {
             pp.clearance    = packClearance_;
             pp.bedOffset    = bedOffset_;
 
-            // Rotated vertices and faces per unique mesh.
+            // Rotated object-space vertices per unique mesh.
+            // Translation is owned entirely by the packer and will be set
+            // absolutely below — do not pre-apply existing T here.
             std::vector<Eigen::MatrixXf> rotV(hdr.meshCount);
             std::vector<Eigen::MatrixXi> faces(hdr.meshCount);
             for (uint32_t m = 0; m < hdr.meshCount; ++m) {
@@ -255,32 +263,32 @@ Result PositionnerStage::process(DataBuffer& data) {
                 faces[m] = results[m].F;
             }
 
-            // Per-instance mesh index and world-space AABBs (after rotation).
+            // Per-instance mesh index and object-space rotated AABBs.
+            // Translation is excluded: the packer assigns it absolutely.
             std::vector<uint32_t>        instMesh(hdr.instanceCount);
             std::vector<Eigen::Vector3f> aabbMin(hdr.instanceCount);
             std::vector<Eigen::Vector3f> aabbMax(hdr.instanceCount);
             for (uint32_t i = 0; i < hdr.instanceCount; ++i) {
-                instMesh[i] = instancesOut[i].meshIndex;
-                aabbMin[i]  = { instancesOut[i].aabbMin.x,
-                                instancesOut[i].aabbMin.y,
-                                instancesOut[i].aabbMin.z };
-                aabbMax[i]  = { instancesOut[i].aabbMax.x,
-                                instancesOut[i].aabbMax.y,
-                                instancesOut[i].aabbMax.z };
+                uint32_t m = instancesOut[i].meshIndex;
+                instMesh[i] = m;
+                aabbMin[i]  = rotV[m].colwise().minCoeff().transpose();
+                aabbMax[i]  = rotV[m].colwise().maxCoeff().transpose();
             }
 
             auto placed = packingPass_.pack(rotV, faces, instMesh, aabbMin, aabbMax, pp);
 
             for (const auto& pl : placed) {
                 float* T = instancesOut[pl.instanceIdx].transform;
-                T[3 * 4 + 0] += pl.tx;
-                T[3 * 4 + 1] += pl.ty;
-                T[3 * 4 + 2] += pl.tz;
+                T[12] = pl.tx;
+                T[13] = pl.ty;
+                T[14] = pl.tz;
 
+                const Eigen::Vector3f& mn0 = aabbMin[pl.instanceIdx];
+                const Eigen::Vector3f& mx0 = aabbMax[pl.instanceIdx];
                 auto& mn = instancesOut[pl.instanceIdx].aabbMin;
                 auto& mx = instancesOut[pl.instanceIdx].aabbMax;
-                mn.x += pl.tx; mn.y += pl.ty; mn.z += pl.tz;
-                mx.x += pl.tx; mx.y += pl.ty; mx.z += pl.tz;
+                mn = { mn0.x() + pl.tx, mn0.y() + pl.ty, mn0.z() + pl.tz };
+                mx = { mx0.x() + pl.tx, mx0.y() + pl.ty, mx0.z() + pl.tz };
             }
         }
     }
