@@ -1,4 +1,5 @@
 #include "OrientationOptimizer.hpp"
+#include <MeshPreprocess.hpp>
 #include <Eigen/Core>
 #include <cassert>
 #include <cmath>
@@ -39,7 +40,7 @@ int main() {
     auto tris = makeTallNeedle();
     Eigen::MatrixXf V;
     Eigen::MatrixXi F;
-    OrientationOptimizer::weldSoup(tris, V, F);
+    weldSoup(tris, V, F);
 
     // 12 triangles → 8 unique corner vertices
     assert(V.rows() == 8);

@@ -14,11 +14,6 @@ struct OrientWeights {
 
 namespace OrientationOptimizer {
 
-/// Converts a triangle soup to an indexed face set using vertex welding.
-/// Returns V (Nv×3) and F (Nf×3).
-void weldSoup(const std::vector<Triangle>& tris,
-              Eigen::MatrixXf& V, Eigen::MatrixXi& F);
-
 /// Builds C = Σ Aᵢ (nᵢ nᵢᵀ) and returns its eigensolver.
 /// The solver's eigenvectors are the candidate orientation axes.
 Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f>

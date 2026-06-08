@@ -38,7 +38,7 @@ endif()
 find_path(SHADERC_INCLUDE_DIR shaderc/shaderc.hpp
     HINTS ${Vulkan_INCLUDE_DIRS} /usr/local/include /opt/homebrew/include
     REQUIRED)
-find_library(SHADERC_LIBRARY NAMES shaderc_combined shaderc shaderc_shared
+find_library(SHADERC_LIBRARY NAMES shaderc_shared shaderc shaderc_combined
     HINTS ${Vulkan_LIBRARY_DIRS} /usr/local/lib /opt/homebrew/lib
     REQUIRED)
 add_library(shaderc::shaderc UNKNOWN IMPORTED)

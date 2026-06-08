@@ -20,62 +20,6 @@ static double msec(Clock::time_point t0) {
 
 namespace OrientationOptimizer {
 
-// ─── weldSoup ────────────────────────────────────────────────────────────────
-// Manual vertex welding — avoids igl::remove_duplicate_vertices which uses
-// Eigen::all, removed in Eigen 5.x.
-
-static size_t quantize(float v, float eps) {
-    return static_cast<size_t>(std::floor(v / eps + 0.5f));
-}
-
-void weldSoup(const std::vector<Triangle>& tris,
-              Eigen::MatrixXf& V, Eigen::MatrixXi& F)
-{
-    constexpr float eps = 1e-6f;
-
-    struct Key {
-        size_t x, y, z;
-        bool operator==(const Key& o) const { return x==o.x && y==o.y && z==o.z; }
-    };
-    struct KeyHash {
-        size_t operator()(const Key& k) const {
-            size_t h = k.x;
-            h ^= k.y + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= k.z + 0x9e3779b9 + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
-
-    std::unordered_map<Key, int, KeyHash> index;
-    std::vector<std::array<float,3>> verts;
-    std::vector<std::array<int,3>>   faces;
-    faces.reserve(tris.size());
-
-    for (const auto& tri : tris) {
-        std::array<int,3> face{};
-        for (int k = 0; k < 3; ++k) {
-            Key key{ quantize(tri.v[k].x, eps),
-                     quantize(tri.v[k].y, eps),
-                     quantize(tri.v[k].z, eps) };
-            auto [it, inserted] = index.emplace(key, (int)verts.size());
-            if (inserted)
-                verts.push_back({tri.v[k].x, tri.v[k].y, tri.v[k].z});
-            face[k] = it->second;
-        }
-        // Degenerate check: skip if two vertices map to the same index
-        if (face[0] != face[1] && face[1] != face[2] && face[0] != face[2])
-            faces.push_back(face);
-    }
-
-    V.resize((int)verts.size(), 3);
-    for (int i = 0; i < (int)verts.size(); ++i)
-        V.row(i) << verts[i][0], verts[i][1], verts[i][2];
-
-    F.resize((int)faces.size(), 3);
-    for (int i = 0; i < (int)faces.size(); ++i)
-        F.row(i) << faces[i][0], faces[i][1], faces[i][2];
-}
-
 // ─── calculateNormalTensor ───────────────────────────────────────────────────
 
 Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f>

@@ -2,7 +2,7 @@
 #include "OrientationOptimizer.hpp"
 #include "PackingPass.hpp"
 
-#include <HalfEdgeMesh.hpp>
+#include <MeshPreprocess.hpp>
 #include <MeshTypes.hpp>
 #include <DataBuffer.hpp>
 #include <Stage.hpp>
@@ -90,6 +90,9 @@ void PositionnerStage::configure(const ParameterValues& v) {
 // ─── process ─────────────────────────────────────────────────────────────────
 
 Result PositionnerStage::process(DataBuffer& data) {
+    // Must run before parsing — it may resize data.cpuData (degenerate tri removal).
+    precomputeWeldedMeshes(data);
+
     const auto* raw = data.cpuData.data();
     const size_t sz = data.cpuData.size();
 
@@ -130,13 +133,12 @@ Result PositionnerStage::process(DataBuffer& data) {
         return Result::fail("positionner: buffer overrun reading instances");
     const MeshInstance* instancesIn = reinterpret_cast<const MeshInstance*>(p);
 
-    // ── Per-unique-mesh: weld + orientation + half-edge ──────────────────────
     OrientWeights weights{ weightPeel_, weightSuction_, weightIslands_ };
 
+    if (data.weldedMeshes.size() < hdr.meshCount)
+        return Result::fail("positionner: weldedMeshes could not be built (malformed buffer?)");
+
     struct MeshResult {
-        Eigen::MatrixXf V;
-        Eigen::MatrixXi F;
-        std::shared_ptr<HalfEdgeMesh> he;
         Eigen::Matrix3f R; // best rotation (identity if orient disabled)
     };
     std::vector<MeshResult> results(hdr.meshCount);
@@ -150,22 +152,12 @@ Result PositionnerStage::process(DataBuffer& data) {
         std::cerr << "[positionner] mesh " << m
                   << " (" << meshes[m].triangleCount << " tris)\n";
 
-        auto t0 = Clock::now();
-        std::vector<Triangle> tris(meshes[m].tris,
-                                   meshes[m].tris + meshes[m].triangleCount);
-        OrientationOptimizer::weldSoup(tris, results[m].V, results[m].F);
-        std::cerr << "  weldSoup:       " << std::fixed << std::setprecision(1) << msec(t0) << " ms"
-                  << "  (" << results[m].V.rows() << " verts, " << results[m].F.rows() << " faces)\n";
-
-        t0 = Clock::now();
-        results[m].he = std::make_shared<HalfEdgeMesh>(
-            HalfEdgeMesh::build(results[m].V, results[m].F));
-        std::cerr << "  halfEdge build: " << msec(t0) << " ms\n";
+        const WeldedMesh& wm = getWeldedMesh(data, m);
 
         if (orientEnable_ && meshes[m].triangleCount > 0) {
-            t0 = Clock::now();
-            auto ci = OrientationOptimizer::candidateAxes(results[m].V, results[m].F, numCandidates_);
-            std::cerr << "  candidateAxes:  " << msec(t0) << " ms"
+            auto t0 = Clock::now();
+            auto ci = OrientationOptimizer::candidateAxes(wm.V, wm.F, numCandidates_);
+            std::cerr << "  candidateAxes:  " << std::fixed << std::setprecision(1) << msec(t0) << " ms"
                       << "  (" << ci.rotations.size() << " directions)\n";
 
             if (suctionPass_) {
@@ -175,27 +167,32 @@ Result PositionnerStage::process(DataBuffer& data) {
                 for (int k = 0; k < N; ++k) {
                     t0 = Clock::now();
                     Eigen::MatrixXf Vr =
-                        (ci.rotations[k] * results[m].V.transpose()).transpose();
+                        (ci.rotations[k] * wm.V.transpose()).transpose();
                     suctionScores[k] =
-                        suctionPass_->render(gpuCtx_, Vr, results[m].F);
+                        suctionPass_->render(gpuCtx_, Vr, wm.F);
                     std::cerr << "  suction[" << k << "]:     " << msec(t0) << " ms"
                               << "  (score=" << suctionScores[k] << ")\n";
                 }
                 t0 = Clock::now();
                 results[m].R = OrientationOptimizer::findBestRotation(
-                    results[m].V, results[m].F, *results[m].he,
-                    weights, suctionScores, ci);
+                    wm.V, wm.F, *wm.halfEdge, weights, suctionScores, ci);
                 std::cerr << "  findBestRot:    " << msec(t0) << " ms\n";
             } else {
                 std::cerr << "  suction: CPU\n";
                 t0 = Clock::now();
                 results[m].R = OrientationOptimizer::findBestRotation(
-                    results[m].V, results[m].F, *results[m].he, weights);
+                    wm.V, wm.F, *wm.halfEdge, weights);
                 std::cerr << "  findBestRot:    " << msec(t0) << " ms\n";
             }
         } else {
             results[m].R = Eigen::Matrix3f::Identity();
         }
+
+        const Eigen::Matrix3f& R = results[m].R;
+        std::cerr << "  bestRotation[" << m << "]:\n"
+                  << "    " << R(0,0) << " " << R(0,1) << " " << R(0,2) << "\n"
+                  << "    " << R(1,0) << " " << R(1,1) << " " << R(1,2) << "\n"
+                  << "    " << R(2,0) << " " << R(2,1) << " " << R(2,2) << "\n";
     }
 
     // ── Rebuild cpuData with updated transforms ──────────────────────────────
@@ -228,7 +225,7 @@ Result PositionnerStage::process(DataBuffer& data) {
                 T[col * 4 + row] = newR(row, col);
 
         // Recompute world-space AABB from rotated unique-mesh vertices
-        const Eigen::MatrixXf& Vr = (R * results[m].V.transpose()).transpose();
+        const Eigen::MatrixXf& Vr = (R * getWeldedMesh(data, m).V.transpose()).transpose();
         Eigen::Vector3f wMin = Vr.colwise().minCoeff().transpose();
         Eigen::Vector3f wMax = Vr.colwise().maxCoeff().transpose();
         // Add translation (column 3, rows 0-2)
@@ -259,8 +256,9 @@ Result PositionnerStage::process(DataBuffer& data) {
             std::vector<Eigen::MatrixXf> rotV(hdr.meshCount);
             std::vector<Eigen::MatrixXi> faces(hdr.meshCount);
             for (uint32_t m = 0; m < hdr.meshCount; ++m) {
-                rotV[m]  = (results[m].R * results[m].V.transpose()).transpose();
-                faces[m] = results[m].F;
+                const WeldedMesh& wm = getWeldedMesh(data, m);
+                rotV[m]  = (results[m].R * wm.V.transpose()).transpose();
+                faces[m] = wm.F;
             }
 
             // Per-instance mesh index and object-space rotated AABBs.
