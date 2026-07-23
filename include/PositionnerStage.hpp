@@ -34,7 +34,7 @@ private:
     bool  packEnable_      = true;
     float packResolution_  = 0.1f;
     float packClearance_   = 0.5f;
-    float bedOffset_       = 0.0f;
+    float bedOffset_       = 5.0f;
 
     // GPU suction pass — null when no GPU context is available.
     std::unique_ptr<SuctionPass> suctionPass_;

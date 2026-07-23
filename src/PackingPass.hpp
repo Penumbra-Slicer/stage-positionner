@@ -1,4 +1,8 @@
 #pragma once
+#define LAVACAKE_NO_VMA_IMPLEMENTATION
+#include <LavaCake/CommandBuffer.hpp>
+#include <LavaCake/ShaderModule.hpp>
+#include <LavaCake/Buffer.hpp>
 #include <GpuContext.hpp>
 #include <Eigen/Core>
 #include <cstdint>
@@ -34,7 +38,7 @@ public:
     /// Compiles the embedded GLSL compute shader at runtime via shaderc.
     void init(const GpuContext& ctx);
 
-    ~PackingPass();
+    ~PackingPass() = default;
 
     /// Place all instances on the build plate.
     /// rotatedV[m] = already-rotated vertex matrix (Nv×3) for unique mesh m.
@@ -48,26 +52,25 @@ public:
 
 private:
     // ── GPU state ─────────────────────────────────────────────────────────────
-    vk::Device         device_   = {};
-    vk::PhysicalDevice physDev_  = {};
-    vk::Queue          queue_    = {};
-    vk::CommandPool    cmdPool_  = {};
-    bool               gpuReady_ = false;
+    vk::Device         device_    = {};
+    vk::Queue          queue_     = {};
+    vk::CommandPool    cmdPool_   = {};
+    void*              allocator_ = nullptr; ///< VmaAllocator handle (opaque)
+    bool               gpuReady_  = false;
 
-    vk::UniqueShaderModule        compMod_;
+    LavaCake::ShaderModule        compMod_;
     vk::UniqueDescriptorSetLayout dsl_;
     vk::UniquePipelineLayout      pipeLayout_;
     vk::UniquePipeline            pipeline_;
     vk::UniqueDescriptorPool      descPool_;
     vk::DescriptorSet             descSet_ = {};
 
-    // Persistent host-visible+coherent SSBOs.
-    // Persistently mapped: ptr stays valid until the buffer is resized.
+    // Persistent host-visible+coherent SSBOs — kept mapped for the lifetime
+    // of the buffer.  LavaCake::Buffer auto-unmaps in its destructor.
     struct GpuBuf {
-        vk::UniqueBuffer       buf;
-        vk::UniqueDeviceMemory mem;
-        vk::DeviceSize         size = 0;
-        float*                 ptr  = nullptr;
+        LavaCake::Buffer buf;
+        vk::DeviceSize   size = 0;
+        float*           ptr  = nullptr;
     };
     GpuBuf globalHM_;    ///< G[plateW * plateH]  — persists across parts
     GpuBuf partZMinBuf_; ///< zMin[partW * partH] — updated per part
@@ -82,8 +85,6 @@ private:
 
     /// Rebind all three SSBOs into descSet_ after any buffer is resized.
     void updateDescSet();
-
-    uint32_t findMemType(uint32_t typeBits, vk::MemoryPropertyFlags props) const;
 
     /// Build Z-Min and Z-Max heightmaps from rotated vertices via vertex
     /// bucketing.  Z values are normalized so the part's absolute Z-min → 0,

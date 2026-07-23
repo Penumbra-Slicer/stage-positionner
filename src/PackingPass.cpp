@@ -1,6 +1,5 @@
+#define LAVACAKE_NO_VMA_IMPLEMENTATION
 #include "PackingPass.hpp"
-
-#include <shaderc/shaderc.hpp>
 
 #include <algorithm>
 #include <cfloat>
@@ -78,28 +77,14 @@ double msec(Clock::time_point t0) {
 // ─── initGpu ─────────────────────────────────────────────────────────────────
 
 void PackingPass::init(const GpuContext& ctx) {
-    device_  = ctx.device;
-    physDev_ = ctx.physDevice;
-    queue_   = ctx.queue;
-    cmdPool_ = ctx.cmdPool;
+    device_    = ctx.device;
+    queue_     = ctx.queue;
+    cmdPool_   = ctx.cmdPool;
+    allocator_ = ctx.allocator;
 
-    // 1. Shader module — compiled from embedded GLSL at runtime
-    {
-        shaderc::Compiler compiler;
-        shaderc::CompileOptions opts;
-        opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-        opts.SetOptimizationLevel(shaderc_optimization_level_performance);
-        auto result = compiler.CompileGlslToSpv(
-            kPackDroptestCompGlsl, shaderc_compute_shader, "pack_droptest.comp", opts);
-        if (result.GetCompilationStatus() != shaderc_compilation_status_success)
-            throw std::runtime_error(std::string("PackingPass: shader compile error: ") +
-                                     result.GetErrorMessage());
-        std::vector<uint32_t> spv(result.cbegin(), result.cend());
-        vk::ShaderModuleCreateInfo si{};
-        si.codeSize = spv.size() * sizeof(uint32_t);
-        si.pCode    = spv.data();
-        compMod_ = device_.createShaderModuleUnique(si);
-    }
+    // 1. Shader module — compiled from embedded GLSL string
+    compMod_ = LavaCake::ShaderModule(ctx.device, kPackDroptestCompGlsl,
+        LavaCake::ShadingLanguage::eGLSL, vk::ShaderStageFlagBits::eCompute, false);
 
     // 2. Descriptor set layout: bindings 0,1,2 = storage buffers in compute stage
     {
@@ -114,7 +99,7 @@ void PackingPass::init(const GpuContext& ctx) {
         dsl_ = device_.createDescriptorSetLayoutUnique(li);
     }
 
-    // 3. Pipeline layout: one descriptor set + push constants (5 × 4 bytes = 20)
+    // 3. Pipeline layout: one descriptor set + push constants (4 × int32 = 16 bytes)
     {
         vk::PushConstantRange pcr{vk::ShaderStageFlagBits::eCompute, 0, 16};
         vk::PipelineLayoutCreateInfo li{};
@@ -129,7 +114,7 @@ void PackingPass::init(const GpuContext& ctx) {
     {
         vk::PipelineShaderStageCreateInfo ss{};
         ss.stage  = vk::ShaderStageFlagBits::eCompute;
-        ss.module = *compMod_;
+        ss.module = compMod_.getShaderModule();
         ss.pName  = "main";
 
         vk::ComputePipelineCreateInfo ci{};
@@ -164,60 +149,23 @@ void PackingPass::init(const GpuContext& ctx) {
     gpuReady_ = true;
 }
 
-PackingPass::~PackingPass() {
-    // Unmap persistently-mapped buffers before RAII destroys them.
-    auto unmap = [&](GpuBuf& b) {
-        if (b.ptr && b.mem) { device_.unmapMemory(*b.mem); b.ptr = nullptr; }
-    };
-    if (device_) {
-        unmap(globalHM_);
-        unmap(partZMinBuf_);
-        unmap(candidates_);
-    }
-}
-
 // ─── GPU helpers ─────────────────────────────────────────────────────────────
-
-uint32_t PackingPass::findMemType(uint32_t typeBits,
-                                   vk::MemoryPropertyFlags props) const
-{
-    auto mem = physDev_.getMemoryProperties();
-    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
-        if ((typeBits & (1u << i)) &&
-            (mem.memoryTypes[i].propertyFlags & props) == props)
-            return i;
-    throw std::runtime_error("PackingPass: no suitable memory type");
-}
 
 void PackingPass::resizeBuf(GpuBuf& b, vk::DeviceSize bytes) {
     if (b.size == bytes) return;
-
-    if (b.ptr)  { device_.unmapMemory(*b.mem); b.ptr = nullptr; }
-    b.buf.reset();
-    b.mem.reset();
-
-    vk::BufferCreateInfo bci{};
-    bci.size  = bytes;
-    bci.usage = vk::BufferUsageFlagBits::eStorageBuffer;
-    b.buf = device_.createBufferUnique(bci);
-
-    auto req = device_.getBufferMemoryRequirements(*b.buf);
-    vk::MemoryAllocateInfo ai{req.size,
-        findMemType(req.memoryTypeBits,
-                    vk::MemoryPropertyFlagBits::eHostVisible |
-                    vk::MemoryPropertyFlagBits::eHostCoherent)};
-    b.mem = device_.allocateMemoryUnique(ai);
-    device_.bindBufferMemory(*b.buf, *b.mem, 0);
-
-    b.ptr  = static_cast<float*>(device_.mapMemory(*b.mem, 0, bytes));
+    auto alloc = reinterpret_cast<VmaAllocator>(allocator_);
+    b.buf  = LavaCake::Buffer(device_, alloc, bytes,
+                              vk::BufferUsageFlagBits::eStorageBuffer,
+                              vk::AllocationCreateFlagBits::eCreateHostAccessSequentialWrite);
+    b.ptr  = static_cast<float*>(b.buf.map());
     b.size = bytes;
 }
 
 void PackingPass::updateDescSet() {
     std::array<vk::DescriptorBufferInfo, 3> infos = {{
-        {*globalHM_.buf,    0, vk::WholeSize},
-        {*partZMinBuf_.buf, 0, vk::WholeSize},
-        {*candidates_.buf,  0, vk::WholeSize},
+        {globalHM_.buf,    0, vk::WholeSize},
+        {partZMinBuf_.buf, 0, vk::WholeSize},
+        {candidates_.buf,  0, vk::WholeSize},
     }};
     std::array<vk::WriteDescriptorSet, 3> writes = {{
         {descSet_, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &infos[0]},

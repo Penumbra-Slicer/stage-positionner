@@ -19,7 +19,7 @@
 
 StageContract PositionnerStage::contract() const {
     return {
-        .cpuDataIn  = CPU_FORMAT_MESH_SCENE_GRAPH_V1,
+        .cpuDataIn  = std::vector<std::string>{CPU_FORMAT_MESH_SCENE_GRAPH_V1},
         .cpuDataOut = CPU_FORMAT_MESH_SCENE_GRAPH_V1,
         .reads  = {},
         .writes = {},
@@ -31,7 +31,7 @@ StageContract PositionnerStage::contract() const {
 std::string PositionnerStage::describeJson() const {
     return
         R"j({"id":"Positionner","name":"Positionner",)j"
-        R"j("cpuDataIn":"mesh/scene_graph_v1",)j"
+        R"j("cpuDataIn":["mesh/scene_graph_v1"],)j"
         R"j("cpuDataOut":"mesh/scene_graph_v1","params":[)j"
         R"j({"key":"orient.enable","label":"Enable orientation","type":"bool","default":true},)j"
         R"j({"key":"orient.num_candidates","label":"Candidate directions","type":"int","min":6,"max":256,"default":32,"step":1},)j"
@@ -41,7 +41,7 @@ std::string PositionnerStage::describeJson() const {
         R"j({"key":"pack.enable","label":"Enable packing","type":"bool","default":true},)j"
         R"j({"key":"pack.resolution","label":"Heightmap resolution (mm/px)","type":"float","min":0.01,"max":5,"default":0.1,"step":0.01},)j"
         R"j({"key":"pack.clearance","label":"Part clearance (mm)","type":"float","min":0,"max":20,"default":0.5,"step":0.1},)j"
-        R"j({"key":"pack.bed_offset","label":"Bed offset / support lift (mm)","type":"float","min":0,"max":50,"default":0,"step":0.5})j"
+        R"j({"key":"pack.bed_offset","label":"Bed offset / support lift (mm)","type":"float","min":0,"max":50,"default":5,"step":0.5})j"
         R"j(]})j";
 }
 
@@ -93,11 +93,11 @@ Result PositionnerStage::process(DataBuffer& data) {
     // Must run before parsing — it may resize data.cpuData (degenerate tri removal).
     precomputeWeldedMeshes(data);
 
-    const auto* raw = data.cpuData.data();
-    const size_t sz = data.cpuData.size();
+    const auto* raw = data.sceneGraph.data();
+    const size_t sz = data.sceneGraph.size();
 
     if (sz < sizeof(SceneGraphHeader))
-        return Result::fail("positionner: cpuData too small for SceneGraphHeader");
+        return Result::fail("positionner: sceneGraph too small for SceneGraphHeader");
 
     SceneGraphHeader hdr;
     std::memcpy(&hdr, raw, sizeof(hdr));
@@ -291,9 +291,9 @@ Result PositionnerStage::process(DataBuffer& data) {
         }
     }
 
-    // Write updated instances back into cpuData
+    // Write updated instances back into sceneGraph
     // (the mesh blocks preceding the instances are untouched)
-    uint8_t* instDst = reinterpret_cast<uint8_t*>(data.cpuData.data())
+    uint8_t* instDst = reinterpret_cast<uint8_t*>(data.sceneGraph.data())
                        + (p - reinterpret_cast<const uint8_t*>(raw));
     std::memcpy(instDst, instancesOut.data(),
                 hdr.instanceCount * sizeof(MeshInstance));
@@ -306,6 +306,9 @@ Result PositionnerStage::process(DataBuffer& data) {
 void PositionnerStage::initGpu(const GpuContext& ctx) {
     std::cerr << "[positionner] initGpu called, available=" << ctx.isAvailable() << "\n";
     if (!ctx.isAvailable()) return;
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(
+        static_cast<VkInstance>(ctx.instance), ::vkGetInstanceProcAddr,
+        static_cast<VkDevice>(ctx.device));
     gpuCtx_ = ctx;
     try {
         suctionPass_ = std::make_unique<SuctionPass>();
@@ -327,8 +330,8 @@ void PositionnerStage::initGpu(const GpuContext& ctx) {
 
 #ifndef PIPELINE_NO_PLUGIN_EXPORTS
 extern "C" {
-    int    pluginApiVersion()          { return PIPELINE_API_VERSION; }
-    Stage* createStage()               { return new PositionnerStage(); }
-    void   destroyStage(Stage* s)      { delete s; }
+    PIPELINE_PLUGIN_API int    pluginApiVersion()          { return PIPELINE_API_VERSION; }
+    PIPELINE_PLUGIN_API Stage* createStage()               { return new PositionnerStage(); }
+    PIPELINE_PLUGIN_API void   destroyStage(Stage* s)      { delete s; }
 }
 #endif

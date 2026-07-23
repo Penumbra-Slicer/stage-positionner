@@ -1,11 +1,13 @@
 #pragma once
+#define LAVACAKE_NO_VMA_IMPLEMENTATION
+#include <LavaCake/CommandBuffer.hpp>
+#include <LavaCake/ShaderModule.hpp>
+#include <LavaCake/Buffer.hpp>
 #include <GpuContext.hpp>
 #include <Eigen/Core>
 
 /// Offscreen Vulkan pass that counts suction-cup pixels for a single candidate
 /// rotation.  Uses dynamic rendering (no VkRenderPass / VkFramebuffer).
-/// Completely LavaCake-free — uses vulkan-hpp directly with the handles from
-/// GpuContext.
 class SuctionPass {
 public:
     /// One-time setup: compiles the embedded GLSL shaders and builds the
@@ -25,7 +27,7 @@ private:
     vk::Device             device_  = {};
     vk::UniquePipeline     pipeline_;
     vk::UniquePipelineLayout layout_;
-    vk::UniqueShaderModule vertMod_, fragMod_;
+    LavaCake::ShaderModule vertMod_, fragMod_;
 
     // Per-frame resources, reallocated when image size changes.
     uint32_t imgW_ = 0, imgH_ = 0;
@@ -33,8 +35,7 @@ private:
     vk::UniqueDeviceMemory colorMem_, depthMem_;
     vk::UniqueImageView    colorView_, depthView_;
     // Host-visible readback buffer (w*h*sizeof(float) bytes).
-    vk::UniqueBuffer       readbackBuf_;
-    vk::UniqueDeviceMemory readbackMem_;
+    LavaCake::Buffer       readbackBuf_;
 
     void resizeImages(const GpuContext& ctx, uint32_t w, uint32_t h);
     uint32_t findMemType(vk::PhysicalDevice pd,

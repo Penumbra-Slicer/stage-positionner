@@ -24,7 +24,6 @@ static void test_keepPosition() {
     Eigen::MatrixXi F; // unused by packing
 
     PackingPass::Params p;
-    p.keepPosition = true;
     p.bedOffset    = 2.0f;
     p.plateX       = 100.f;
     p.plateY       = 100.f;

@@ -1,7 +1,7 @@
+#define LAVACAKE_NO_VMA_IMPLEMENTATION
 #include "SuctionPass.hpp"
 
 #include <Eigen/Geometry>
-#include <shaderc/shaderc.hpp>
 
 #include <array>
 #include <cstring>
@@ -33,23 +33,6 @@ void main() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-static vk::UniqueShaderModule compileGlsl(vk::Device device, const char* src,
-                                          shaderc_shader_kind kind, const char* name) {
-    shaderc::Compiler compiler;
-    shaderc::CompileOptions opts;
-    opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    opts.SetOptimizationLevel(shaderc_optimization_level_performance);
-    auto result = compiler.CompileGlslToSpv(src, kind, name, opts);
-    if (result.GetCompilationStatus() != shaderc_compilation_status_success)
-        throw std::runtime_error(std::string("SuctionPass: shader compile error (") +
-                                 name + "): " + result.GetErrorMessage());
-    std::vector<uint32_t> spv(result.cbegin(), result.cend());
-    vk::ShaderModuleCreateInfo ci{};
-    ci.codeSize = spv.size() * sizeof(uint32_t);
-    ci.pCode    = spv.data();
-    return device.createShaderModuleUnique(ci);
-}
-
 uint32_t SuctionPass::findMemType(vk::PhysicalDevice pd,
                                   uint32_t           typeBits,
                                   vk::MemoryPropertyFlags props) const
@@ -68,11 +51,11 @@ uint32_t SuctionPass::findMemType(vk::PhysicalDevice pd,
 void SuctionPass::init(const GpuContext& ctx) {
     device_ = ctx.device;
 
-    // 1. Shader modules
-    {
-        vertMod_ = compileGlsl(ctx.device, kSuctionVertGlsl, shaderc_vertex_shader,   "suction.vert");
-        fragMod_ = compileGlsl(ctx.device, kSuctionFragGlsl, shaderc_fragment_shader, "suction.frag");
-    }
+    // 1. Shader modules — compiled from embedded GLSL strings
+    vertMod_ = LavaCake::ShaderModule(ctx.device, kSuctionVertGlsl,
+        LavaCake::ShadingLanguage::eGLSL, vk::ShaderStageFlagBits::eVertex, false);
+    fragMod_ = LavaCake::ShaderModule(ctx.device, kSuctionFragGlsl,
+        LavaCake::ShadingLanguage::eGLSL, vk::ShaderStageFlagBits::eFragment, false);
 
     // 2. Pipeline layout — one push constant: mat4 (64 bytes) in vertex stage
     {
@@ -88,10 +71,10 @@ void SuctionPass::init(const GpuContext& ctx) {
         // Shader stages
         std::array<vk::PipelineShaderStageCreateInfo, 2> stages{};
         stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-        stages[0].module = *vertMod_;
+        stages[0].module = vertMod_.getShaderModule();
         stages[0].pName  = "main";
         stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-        stages[1].module = *fragMod_;
+        stages[1].module = fragMod_.getShaderModule();
         stages[1].pName  = "main";
 
         // Vertex input: binding 0, stride 12, vec3 at location 0
@@ -232,20 +215,11 @@ void SuctionPass::resizeImages(const GpuContext& ctx, uint32_t w, uint32_t h) {
     }
 
     // Readback buffer: host-visible, w*h*sizeof(float)
-    {
-        vk::BufferCreateInfo bci{};
-        bci.size  = static_cast<vk::DeviceSize>(w) * h * sizeof(float);
-        bci.usage = vk::BufferUsageFlagBits::eTransferDst;
-        readbackBuf_ = ctx.device.createBufferUnique(bci);
-
-        auto req = ctx.device.getBufferMemoryRequirements(*readbackBuf_);
-        vk::MemoryAllocateInfo ai{req.size,
-            findMemType(ctx.physDevice, req.memoryTypeBits,
-                        vk::MemoryPropertyFlagBits::eHostVisible |
-                        vk::MemoryPropertyFlagBits::eHostCoherent)};
-        readbackMem_ = ctx.device.allocateMemoryUnique(ai);
-        ctx.device.bindBufferMemory(*readbackBuf_, *readbackMem_, 0);
-    }
+    auto alloc = reinterpret_cast<VmaAllocator>(ctx.allocator);
+    readbackBuf_ = LavaCake::Buffer(ctx.device, alloc,
+        static_cast<vk::DeviceSize>(w) * h * sizeof(float),
+        vk::BufferUsageFlagBits::eTransferDst,
+        vk::AllocationCreateFlagBits::eCreateHostAccessRandom);
 
     imgW_ = w;
     imgH_ = h;
@@ -292,33 +266,23 @@ int SuctionPass::render(const GpuContext& ctx,
         idata[i * 3 + 2] = static_cast<uint32_t>(F(i, 2));
     }
 
+    auto alloc = reinterpret_cast<VmaAllocator>(ctx.allocator);
     auto makeHostBuf = [&](const void* src, vk::DeviceSize sz,
-                           vk::BufferUsageFlags usage)
-        -> std::pair<vk::UniqueBuffer, vk::UniqueDeviceMemory>
-    {
-        vk::BufferCreateInfo bci{};
-        bci.size  = sz;
-        bci.usage = usage;
-        auto buf = ctx.device.createBufferUnique(bci);
-        auto req = ctx.device.getBufferMemoryRequirements(*buf);
-        vk::MemoryAllocateInfo ai{req.size,
-            findMemType(ctx.physDevice, req.memoryTypeBits,
-                        vk::MemoryPropertyFlagBits::eHostVisible |
-                        vk::MemoryPropertyFlagBits::eHostCoherent)};
-        auto mem = ctx.device.allocateMemoryUnique(ai);
-        ctx.device.bindBufferMemory(*buf, *mem, 0);
-        void* mapped = ctx.device.mapMemory(*mem, 0, sz);
+                           vk::BufferUsageFlags usage) {
+        LavaCake::Buffer buf(ctx.device, alloc, sz, usage,
+                             vk::AllocationCreateFlagBits::eCreateHostAccessSequentialWrite);
+        void* mapped = buf.map();
         std::memcpy(mapped, src, sz);
-        ctx.device.unmapMemory(*mem);
-        return {std::move(buf), std::move(mem)};
+        buf.unmap();
+        return buf;
     };
 
-    auto [vbuf, vmem] = makeHostBuf(vdata.data(),
-                                    vdata.size() * sizeof(float),
-                                    vk::BufferUsageFlagBits::eVertexBuffer);
-    auto [ibuf, imem] = makeHostBuf(idata.data(),
-                                    idata.size() * sizeof(uint32_t),
-                                    vk::BufferUsageFlagBits::eIndexBuffer);
+    auto vbuf = makeHostBuf(vdata.data(),
+                            vdata.size() * sizeof(float),
+                            vk::BufferUsageFlagBits::eVertexBuffer);
+    auto ibuf = makeHostBuf(idata.data(),
+                            idata.size() * sizeof(uint32_t),
+                            vk::BufferUsageFlagBits::eIndexBuffer);
 
     // ── Orthographic MVP ─────────────────────────────────────────────────────
     // Maps [xMin,xMax]×[yMin,yMax]×[zMin,zMax] → NDC [-1,1]×[-1,1]×[0,1].
@@ -404,8 +368,8 @@ int SuctionPass::render(const GpuContext& ctx,
 
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_);
     vk::DeviceSize zero = 0;
-    cmd.bindVertexBuffers(0, *vbuf, zero);
-    cmd.bindIndexBuffer(*ibuf, 0, vk::IndexType::eUint32);
+    cmd.bindVertexBuffers(0, vbuf.getBuffer(), zero);
+    cmd.bindIndexBuffer(ibuf.getBuffer(), 0, vk::IndexType::eUint32);
     cmd.pushConstants(*layout_, vk::ShaderStageFlagBits::eVertex, 0, 64, mvp);
     cmd.drawIndexed(static_cast<uint32_t>(nf * 3), 1, 0, 0, 0);
 
@@ -430,12 +394,12 @@ int SuctionPass::render(const GpuContext& ctx,
         region.imageExtent      = vk::Extent3D{w, h, 1};
         cmd.copyImageToBuffer(*colorImg_,
                               vk::ImageLayout::eTransferSrcOptimal,
-                              *readbackBuf_, region);
+                              readbackBuf_.getBuffer(), region);
     }
     // Ensure copy is visible to host
     {
         vk::BufferMemoryBarrier b{};
-        b.buffer      = *readbackBuf_;
+        b.buffer      = readbackBuf_.getBuffer();
         b.offset      = 0;
         b.size        = VK_WHOLE_SIZE;
         b.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
@@ -453,20 +417,22 @@ int SuctionPass::render(const GpuContext& ctx,
     vk::SubmitInfo si{};
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &cmd;
-    ctx.queue.submit(si, *fence);
+    {
+        std::lock_guard<std::mutex> lk(*ctx.queueMutex);
+        ctx.queue.submit(si, *fence);
+    }
     static_cast<void>(ctx.device.waitForFences(*fence, VK_TRUE,
                                                std::numeric_limits<uint64_t>::max()));
 
     ctx.device.freeCommandBuffers(ctx.cmdPool, cmd);
 
     // ── Count back-facing (suction) pixels ───────────────────────────────────
-    const auto* pixels = static_cast<const float*>(
-        ctx.device.mapMemory(*readbackMem_, 0, VK_WHOLE_SIZE));
+    const auto* pixels = static_cast<const float*>(readbackBuf_.map());
     int count = 0;
     const int total = static_cast<int>(w * h);
     for (int i = 0; i < total; ++i)
         if (pixels[i] > 0.5f) ++count;
-    ctx.device.unmapMemory(*readbackMem_);
+    readbackBuf_.unmap();
 
     return count;
 }

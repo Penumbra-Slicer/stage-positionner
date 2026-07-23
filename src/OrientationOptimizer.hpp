@@ -6,10 +6,11 @@
 #include <array>
 #include <vector>
 
+/// @brief Relative importance of each penalty term in the orientation scoring function.
 struct OrientWeights {
-    float peel    = 0.6f;
-    float suction = 0.25f;
-    float islands = 0.15f;
+    float peel    = 0.6f;  ///< Weight for peel-force proxy (normal-tensor eigenvalue ratio).
+    float suction = 0.25f; ///< Weight for trapped-volume (suction cup) count.
+    float islands = 0.15f; ///< Weight for disconnected Z-minimum (floating island) count.
 };
 
 namespace OrientationOptimizer {
