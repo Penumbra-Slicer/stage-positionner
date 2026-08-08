@@ -72,6 +72,38 @@ using Clock = std::chrono::steady_clock;
 double msec(Clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 }
+
+// Stamp a footprint's Z-max profile onto the global heightmap at
+// (bestPx,bestPy), dilated by `clearance` — shared by the main placement
+// loop (a part it just placed) and the fixed-obstacle pre-stamp (a
+// position-locked instance's existing footprint). Returns the footprint's
+// own peak height (zTop) so callers can log/derive absolute top height
+// without recomputing it.
+float stampHeightmap(std::vector<float>& G_cpu, float* globalHMPtr, bool gpuReady,
+                      int plateW, int plateH,
+                      const std::vector<float>& zMax, int w, int h,
+                      int bestPx, int bestPy, float bestZ,
+                      float clearance, float resolution) {
+    float zTop = 0.f;
+    for (int j = 0; j < h; ++j)
+        for (int i = 0; i < w; ++i)
+            zTop = std::max(zTop, zMax[j * w + i]);
+
+    const int cp = (clearance > 0.f) ? static_cast<int>(std::ceil(clearance / resolution)) : 0;
+    for (int j = -cp; j < h + cp; ++j) {
+        for (int i = -cp; i < w + cp; ++i) {
+            const int gx = bestPx + i;
+            const int gy = bestPy + j;
+            if (gx < 0 || gx >= plateW || gy < 0 || gy >= plateH) continue;
+            const float zx = (j >= 0 && j < h && i >= 0 && i < w) ? zMax[j * w + i] : zTop;
+            const int   gIdx = gy * plateW + gx;
+            const float newZ = bestZ + zx;
+            G_cpu[gIdx] = std::max(G_cpu[gIdx], newZ);
+            if (gpuReady) globalHMPtr[gIdx] = G_cpu[gIdx];
+        }
+    }
+    return zTop;
+}
 } // namespace
 
 // ─── initGpu ─────────────────────────────────────────────────────────────────
@@ -227,7 +259,8 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
     const std::vector<uint32_t>&         instMeshIdx,
     const std::vector<Eigen::Vector3f>&  instAABBMin,
     const std::vector<Eigen::Vector3f>&  instAABBMax,
-    const Params&                        p)
+    const Params&                        p,
+    const std::vector<Eigen::MatrixXf>&  fixedWorldVerts)
 {
     const uint32_t N = static_cast<uint32_t>(instMeshIdx.size());
     std::vector<PlacedInstance> result(N);
@@ -283,6 +316,26 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
     std::vector<float> G_cpu(plateW * plateH, p.bedOffset);
     if (gpuReady_)
         std::fill(globalHM_.ptr, globalHM_.ptr + plateW * plateH, p.bedOffset);
+
+    // ── Stamp position-locked instances as fixed obstacles ───────────────────
+    // Before anything gets placed, so the placement loop below naturally
+    // avoids them (same stamp mechanism a freshly-placed part uses on itself).
+    for (const auto& Vw : fixedWorldVerts) {
+        std::vector<float> zMinF, zMaxF;
+        int wF = 0, hF = 0;
+        float xOffF = 0.f, yOffF = 0.f;
+        buildHeightmaps(Vw, p.resolution, zMinF, zMaxF, wF, hF, xOffF, yOffF);
+        // Vw is already in world space, so buildHeightmaps' own xOff/yOff
+        // (= min X/Y of whatever vertices it's given) directly IS the plate
+        // offset — no relative-to-absolute translation needed, unlike the
+        // drop-test below which searches for a placement.
+        const int   bestPxF = static_cast<int>(std::round(xOffF / p.resolution));
+        const int   bestPyF = static_cast<int>(std::round(yOffF / p.resolution));
+        const float bestZF  = Vw.col(2).minCoeff();
+        stampHeightmap(G_cpu, gpuReady_ ? globalHM_.ptr : nullptr, gpuReady_,
+                       plateW, plateH, zMaxF, wF, hF, bestPxF, bestPyF, bestZF,
+                       p.clearance, p.resolution);
+    }
 
     // ── Main packing loop ─────────────────────────────────────────────────────
     for (uint32_t ii = 0; ii < N; ++ii) {
@@ -408,28 +461,11 @@ std::vector<PackingPass::PlacedInstance> PackingPass::pack(
 
         // ── Stamp G with XY clearance expansion ───────────────────────────────
         t0 = Clock::now();
-        float zTop = 0.f;
-        for (int j = 0; j < msh.h; ++j)
-            for (int i = 0; i < msh.w; ++i)
-                zTop = std::max(zTop, msh.zMax[j * msh.w + i]);
-
+        const float zTop = stampHeightmap(G_cpu, gpuReady_ ? globalHM_.ptr : nullptr, gpuReady_,
+                                          plateW, plateH, msh.zMax, msh.w, msh.h,
+                                          bestPx, bestPy, bestZ, p.clearance, p.resolution);
         const int cp = (p.clearance > 0.f)
             ? static_cast<int>(std::ceil(p.clearance / p.resolution)) : 0;
-
-        for (int j = -cp; j < msh.h + cp; ++j) {
-            for (int i = -cp; i < msh.w + cp; ++i) {
-                const int gx = bestPx + i;
-                const int gy = bestPy + j;
-                if (gx < 0 || gx >= plateW || gy < 0 || gy >= plateH) continue;
-                const float zx = (j >= 0 && j < msh.h && i >= 0 && i < msh.w)
-                                 ? msh.zMax[j * msh.w + i] : zTop;
-                const int   gIdx = gy * plateW + gx;
-                const float newZ = bestZ + zx;
-                G_cpu[gIdx] = std::max(G_cpu[gIdx], newZ);
-                if (gpuReady_)
-                    globalHM_.ptr[gIdx] = G_cpu[gIdx];
-            }
-        }
         const float absTop = bestZ + zTop;
         std::cerr << "  stamp[" << instIdx << "]:      " << msec(t0) << " ms"
                   << "  z=" << bestZ << " mm  zTop=" << absTop << " mm"

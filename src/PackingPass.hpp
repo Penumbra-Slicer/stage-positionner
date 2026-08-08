@@ -42,13 +42,20 @@ public:
 
     /// Place all instances on the build plate.
     /// rotatedV[m] = already-rotated vertex matrix (Nv×3) for unique mesh m.
+    /// `fixedWorldVerts` (optional) are position-locked instances' fully
+    /// world-space (rotated + translated) vertices — stamped onto the
+    /// heightmap as pre-existing obstacles *before* placement begins, so the
+    /// instances actually being packed avoid overlapping them. They are not
+    /// returned in the result (their position is left untouched by the
+    /// caller).
     std::vector<PlacedInstance> pack(
         const std::vector<Eigen::MatrixXf>& rotatedV,
         const std::vector<Eigen::MatrixXi>& faces,
         const std::vector<uint32_t>&         instMeshIdx,
         const std::vector<Eigen::Vector3f>&  instAABBMin,
         const std::vector<Eigen::Vector3f>&  instAABBMax,
-        const Params&                        params);
+        const Params&                        params,
+        const std::vector<Eigen::MatrixXf>&  fixedWorldVerts = {});
 
 private:
     // ── GPU state ─────────────────────────────────────────────────────────────

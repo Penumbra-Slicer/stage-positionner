@@ -4,16 +4,37 @@
 
 #include <MeshPreprocess.hpp>
 #include <MeshTypes.hpp>
+#include <MeshTransform.hpp>
 #include <DataBuffer.hpp>
 #include <Stage.hpp>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <vector>
+
+namespace {
+constexpr float kDeg2Rad = 3.14159265358979323846f / 180.f;
+constexpr float kRad2Deg = 180.f / 3.14159265358979323846f;
+
+// Matches Core/include/MeshTransform.hpp's decodeTransformMatrix rotation convention:
+// R = Rz(rz) * Ry(ry) * Rx(rx), degrees.
+Eigen::Matrix3f eulerDegToMatrix(const Vec3f& deg) {
+    return (Eigen::AngleAxisf(deg.z * kDeg2Rad, Eigen::Vector3f::UnitZ()) *
+            Eigen::AngleAxisf(deg.y * kDeg2Rad, Eigen::Vector3f::UnitY()) *
+            Eigen::AngleAxisf(deg.x * kDeg2Rad, Eigen::Vector3f::UnitX())).toRotationMatrix();
+}
+
+// Inverse of eulerDegToMatrix — recovers (rx,ry,rz) in degrees from R = Rz*Ry*Rx.
+Vec3f matrixToEulerDeg(const Eigen::Matrix3f& R) {
+    const Eigen::Vector3f zyx = R.eulerAngles(2, 1, 0); // (about Z, about Y, about X), radians
+    return { zyx.z() * kRad2Deg, zyx.y() * kRad2Deg, zyx.x() * kRad2Deg };
+}
+} // namespace
 
 // ─── StageContract ───────────────────────────────────────────────────────────
 
@@ -138,8 +159,21 @@ Result PositionnerStage::process(DataBuffer& data) {
     if (data.weldedMeshes.size() < hdr.meshCount)
         return Result::fail("positionner: weldedMeshes could not be built (malformed buffer?)");
 
+    // Per-mesh rotation lock: true if the mesh's instance has rotation
+    // locked. In the current app every mesh has exactly one instance (see
+    // MessageHandler::Model), so "the mesh's instance" is unambiguous; if
+    // that ever changes, this takes the first instance found for the mesh.
+    std::vector<bool> meshRotationLocked(hdr.meshCount, false);
+    for (uint32_t i = 0; i < hdr.instanceCount; ++i) {
+        uint32_t m = instancesIn[i].meshIndex;
+        if (m < hdr.meshCount &&
+            (instancesIn[i].lockMask & static_cast<uint32_t>(TransformLock::Rotation)))
+            meshRotationLocked[m] = true;
+    }
+
     struct MeshResult {
-        Eigen::Matrix3f R; // best rotation (identity if orient disabled)
+        Eigen::Matrix3f R; // best NEW rotation to compose onto each instance's
+                           // stored rotation (identity if orient disabled or locked)
     };
     std::vector<MeshResult> results(hdr.meshCount);
 
@@ -154,7 +188,10 @@ Result PositionnerStage::process(DataBuffer& data) {
 
         const WeldedMesh& wm = getWeldedMesh(data, m);
 
-        if (orientEnable_ && meshes[m].triangleCount > 0) {
+        if (meshRotationLocked[m]) {
+            std::cerr << "  rotation locked — skipping auto-orient\n";
+            results[m].R = Eigen::Matrix3f::Identity();
+        } else if (orientEnable_ && meshes[m].triangleCount > 0) {
             auto t0 = Clock::now();
             auto ci = OrientationOptimizer::candidateAxes(wm.V, wm.F, numCandidates_);
             std::cerr << "  candidateAxes:  " << std::fixed << std::setprecision(1) << msec(t0) << " ms"
@@ -197,50 +234,74 @@ Result PositionnerStage::process(DataBuffer& data) {
 
     // ── Rebuild cpuData with updated transforms ──────────────────────────────
     // We rewrite the buffer in-place: header + mesh blocks are unchanged;
-    // only the MeshInstance transforms and AABBs are updated.
+    // only the MeshInstance fields are updated. Position/rotation/scale are
+    // the source of truth (see MeshTypes.hpp) — transform[16] is always
+    // re-derived from them via decodeTransformMatrix, never hand-edited, so it can't
+    // drift out of sync the way the old matrix-only version could.
 
-    // Build updated instances
     std::vector<MeshInstance> instancesOut(hdr.instanceCount);
+    // Per-mesh FINAL rotation (auto ∘ stored, respecting locks) and scale —
+    // used below by the packing step so a previously-rotated/scaled
+    // instance's TRUE footprint is what gets packed and grounded, not this
+    // pass's auto-rotation delta on an assumed-unscaled mesh (a scaled-down
+    // object's drop-test needs its actual, smaller footprint/height, or it
+    // gets grounded as if it were still full-size and ends up floating).
+    std::vector<Eigen::Matrix3f>  finalR(hdr.meshCount, Eigen::Matrix3f::Identity());
+    std::vector<Eigen::Vector3f>  meshScale(hdr.meshCount, Eigen::Vector3f(1.f, 1.f, 1.f));
+    std::vector<uint32_t> fixedIdx, toPlaceIdx; // split by position lock
+
     for (uint32_t i = 0; i < hdr.instanceCount; ++i) {
         instancesOut[i] = instancesIn[i];
         uint32_t m = instancesIn[i].meshIndex;
         if (m >= hdr.meshCount) continue;
 
-        const Eigen::Matrix3f& R = results[m].R;
+        const bool rotLocked = instancesIn[i].lockMask & static_cast<uint32_t>(TransformLock::Rotation);
+        const bool posLocked = instancesIn[i].lockMask & static_cast<uint32_t>(TransformLock::Position);
 
-        // Compose R into the existing column-major 4×4 transform.
-        // The existing transform stores rotation in columns 0-2, rows 0-2.
-        // We left-multiply the rotation block by R.
-        float* T = instancesOut[i].transform;
-        // Extract current 3×3 rotation block (column-major)
-        Eigen::Matrix3f curR;
-        for (int col = 0; col < 3; ++col)
-            for (int row = 0; row < 3; ++row)
-                curR(row, col) = T[col * 4 + row];
-
-        Eigen::Matrix3f newR = R * curR;
-
-        for (int col = 0; col < 3; ++col)
-            for (int row = 0; row < 3; ++row)
-                T[col * 4 + row] = newR(row, col);
-
-        // Recompute world-space AABB from rotated unique-mesh vertices
-        const Eigen::MatrixXf& Vr = (R * getWeldedMesh(data, m).V.transpose()).transpose();
-        Eigen::Vector3f wMin = Vr.colwise().minCoeff().transpose();
-        Eigen::Vector3f wMax = Vr.colwise().maxCoeff().transpose();
-        // Add translation (column 3, rows 0-2)
-        for (int k = 0; k < 3; ++k) {
-            wMin(k) += T[3 * 4 + k];
-            wMax(k) += T[3 * 4 + k];
+        Eigen::Matrix3f newR;
+        if (rotLocked) {
+            // Untouched — go straight from stored Euler angles back to the
+            // same angles, no matrix round-trip that could drift them.
+            instancesOut[i].rotation = instancesIn[i].rotation;
+            newR = eulerDegToMatrix(instancesOut[i].rotation);
+        } else {
+            newR = results[m].R * eulerDegToMatrix(instancesIn[i].rotation);
+            instancesOut[i].rotation = matrixToEulerDeg(newR);
         }
-        instancesOut[i].aabbMin = { wMin(0), wMin(1), wMin(2) };
-        instancesOut[i].aabbMax = { wMax(0), wMax(1), wMax(2) };
+        finalR[m] = newR;
+
+        instancesOut[i].scale    = instancesIn[i].scale;    // positioner never touches scale
+        meshScale[m] = Eigen::Vector3f(instancesOut[i].scale.x, instancesOut[i].scale.y, instancesOut[i].scale.z);
+        instancesOut[i].position = instancesIn[i].position; // packing below may overwrite this if unlocked
+
+        const Vec3f pivot = mesh::bboxCenter(meshes[m].aabbMin, meshes[m].aabbMax);
+        mesh::decodeTransformMatrix(instancesOut[i].position, instancesOut[i].rotation,
+                                    instancesOut[i].scale, meshes[m].aabbMin, meshes[m].aabbMax,
+                                    instancesOut[i].transform);
+
+        // Tight world AABB from the actual (welded) mesh geometry, scaled
+        // and rotated about that same pivot — not just the rotated axis-
+        // aligned box, which would over-estimate it for non-box-like meshes.
+        const Eigen::Vector3f pivotVec(pivot.x, pivot.y, pivot.z);
+        const Eigen::Vector3f scaleVec(instancesOut[i].scale.x, instancesOut[i].scale.y, instancesOut[i].scale.z);
+        const Eigen::MatrixXf Vshifted = getWeldedMesh(data, m).V.rowwise() - pivotVec.transpose();
+        const Eigen::MatrixXf Vscaled  = Vshifted * scaleVec.asDiagonal();
+        const Eigen::MatrixXf Vr       = (newR * Vscaled.transpose()).transpose();
+        const Eigen::Vector3f posVec(instancesOut[i].position.x, instancesOut[i].position.y, instancesOut[i].position.z);
+        const Eigen::Vector3f wMin = Vr.colwise().minCoeff().transpose() + posVec;
+        const Eigen::Vector3f wMax = Vr.colwise().maxCoeff().transpose() + posVec;
+        instancesOut[i].aabbMin = { wMin.x(), wMin.y(), wMin.z() };
+        instancesOut[i].aabbMax = { wMax.x(), wMax.y(), wMax.z() };
+
+        (posLocked ? fixedIdx : toPlaceIdx).push_back(i);
     }
 
     // ── Packing ───────────────────────────────────────────────────────────────
     if (packEnable_) {
         if (data.printer.buildXMm == 0.f) {
             std::cerr << "[positionner] packing skipped: printer profile not set\n";
+        } else if (toPlaceIdx.empty()) {
+            std::cerr << "[positionner] packing skipped: every instance's position is locked\n";
         } else {
             PackingPass::Params pp;
             pp.plateX       = data.printer.buildXMm;
@@ -250,43 +311,84 @@ Result PositionnerStage::process(DataBuffer& data) {
             pp.clearance    = packClearance_;
             pp.bedOffset    = bedOffset_;
 
-            // Rotated object-space vertices per unique mesh.
-            // Translation is owned entirely by the packer and will be set
-            // absolutely below — do not pre-apply existing T here.
+            // Scaled + rotated object-space vertices per unique mesh, using
+            // the FINAL rotation/scale (auto ∘ stored, respecting locks)
+            // about the SAME pivot every other consumer uses (bboxCenter —
+            // see MeshTransform.hpp). Scale matters here: a scaled-down
+            // object's drop-test needs its actual (smaller) footprint and
+            // height, or the plate thinks it's still full-size and grounds
+            // it too high, leaving the real (smaller) mesh floating. rotV is
+            // pivot-relative: a vertex at the pivot maps to (0,0,0), so
+            // whatever (tx,ty,tz) the packer assigns IS the world-space
+            // location of the pivot, directly usable as `position`.
             std::vector<Eigen::MatrixXf> rotV(hdr.meshCount);
             std::vector<Eigen::MatrixXi> faces(hdr.meshCount);
             for (uint32_t m = 0; m < hdr.meshCount; ++m) {
                 const WeldedMesh& wm = getWeldedMesh(data, m);
-                rotV[m]  = (results[m].R * wm.V.transpose()).transpose();
+                const Vec3f pivot = mesh::bboxCenter(meshes[m].aabbMin, meshes[m].aabbMax);
+                const Eigen::Vector3f pivotVec(pivot.x, pivot.y, pivot.z);
+                const Eigen::MatrixXf Vshifted = wm.V.rowwise() - pivotVec.transpose();
+                const Eigen::MatrixXf Vscaled  = Vshifted * meshScale[m].asDiagonal();
+                rotV[m]  = (finalR[m] * Vscaled.transpose()).transpose();
                 faces[m] = wm.F;
             }
 
-            // Per-instance mesh index and object-space rotated AABBs.
-            // Translation is excluded: the packer assigns it absolutely.
-            std::vector<uint32_t>        instMesh(hdr.instanceCount);
-            std::vector<Eigen::Vector3f> aabbMin(hdr.instanceCount);
-            std::vector<Eigen::Vector3f> aabbMax(hdr.instanceCount);
-            for (uint32_t i = 0; i < hdr.instanceCount; ++i) {
-                uint32_t m = instancesOut[i].meshIndex;
-                instMesh[i] = m;
-                aabbMin[i]  = rotV[m].colwise().minCoeff().transpose();
-                aabbMax[i]  = rotV[m].colwise().maxCoeff().transpose();
+            // Only instances NOT position-locked are handed to the packer as
+            // things it may place; their mesh index / object-space rotated AABBs.
+            std::vector<uint32_t>        instMesh(toPlaceIdx.size());
+            std::vector<Eigen::Vector3f> aabbMin(toPlaceIdx.size());
+            std::vector<Eigen::Vector3f> aabbMax(toPlaceIdx.size());
+            for (size_t k = 0; k < toPlaceIdx.size(); ++k) {
+                uint32_t m = instancesOut[toPlaceIdx[k]].meshIndex;
+                instMesh[k] = m;
+                aabbMin[k]  = rotV[m].colwise().minCoeff().transpose();
+                aabbMax[k]  = rotV[m].colwise().maxCoeff().transpose();
             }
 
-            auto placed = packingPass_.pack(rotV, faces, instMesh, aabbMin, aabbMax, pp);
+            // Position-locked instances: rotV is pivot-relative (see above),
+            // so adding their current `position` directly gives their true
+            // world footprint — stamped as a fixed obstacle rather than placed.
+            std::vector<Eigen::MatrixXf> fixedWorldVerts(fixedIdx.size());
+            for (size_t k = 0; k < fixedIdx.size(); ++k) {
+                const MeshInstance& fi = instancesOut[fixedIdx[k]];
+                fixedWorldVerts[k] = rotV[fi.meshIndex].rowwise()
+                                   + Eigen::RowVector3f(fi.position.x, fi.position.y, fi.position.z);
+            }
+
+            auto placed = packingPass_.pack(rotV, faces, instMesh, aabbMin, aabbMax, pp, fixedWorldVerts);
 
             for (const auto& pl : placed) {
-                float* T = instancesOut[pl.instanceIdx].transform;
-                T[12] = pl.tx;
-                T[13] = pl.ty;
-                T[14] = pl.tz;
+                const uint32_t instIdx = toPlaceIdx[pl.instanceIdx]; // pl.instanceIdx indexes the toPlaceIdx-filtered arrays above
+                const uint32_t m       = instancesOut[instIdx].meshIndex;
 
-                const Eigen::Vector3f& mn0 = aabbMin[pl.instanceIdx];
-                const Eigen::Vector3f& mx0 = aabbMax[pl.instanceIdx];
-                auto& mn = instancesOut[pl.instanceIdx].aabbMin;
-                auto& mx = instancesOut[pl.instanceIdx].aabbMax;
-                mn = { mn0.x() + pl.tx, mn0.y() + pl.ty, mn0.z() + pl.tz };
-                mx = { mx0.x() + pl.tx, mx0.y() + pl.ty, mx0.z() + pl.tz };
+                // (pl.tx,pl.ty,pl.tz) IS the pivot's world location (see the
+                // rotV note above) — i.e. exactly `position`. Rebuild the
+                // final transform through the same decode path everything
+                // else uses, so scale gets applied correctly around this
+                // pivot instead of being baked in via a hand-poked
+                // translation (that mismatch was the root cause of scaled
+                // objects landing below the plate).
+                instancesOut[instIdx].position = { pl.tx, pl.ty, pl.tz };
+                mesh::decodeTransformMatrix(instancesOut[instIdx].position, instancesOut[instIdx].rotation,
+                                            instancesOut[instIdx].scale,
+                                            meshes[m].aabbMin, meshes[m].aabbMax,
+                                            instancesOut[instIdx].transform);
+
+                // Tight, scale-correct world AABB — same approach as the
+                // pre-packing pass above, now at the packer's final position.
+                const Vec3f pivot = mesh::bboxCenter(meshes[m].aabbMin, meshes[m].aabbMax);
+                const Eigen::Vector3f pivotVec(pivot.x, pivot.y, pivot.z);
+                const Eigen::Vector3f scaleVec(instancesOut[instIdx].scale.x,
+                                               instancesOut[instIdx].scale.y,
+                                               instancesOut[instIdx].scale.z);
+                const Eigen::MatrixXf Vshifted = getWeldedMesh(data, m).V.rowwise() - pivotVec.transpose();
+                const Eigen::MatrixXf Vscaled  = Vshifted * scaleVec.asDiagonal();
+                const Eigen::MatrixXf Vr       = (finalR[m] * Vscaled.transpose()).transpose();
+                const Eigen::Vector3f posVec(pl.tx, pl.ty, pl.tz);
+                const Eigen::Vector3f wMin = Vr.colwise().minCoeff().transpose() + posVec;
+                const Eigen::Vector3f wMax = Vr.colwise().maxCoeff().transpose() + posVec;
+                instancesOut[instIdx].aabbMin = { wMin.x(), wMin.y(), wMin.z() };
+                instancesOut[instIdx].aabbMax = { wMax.x(), wMax.y(), wMax.z() };
             }
         }
     }
